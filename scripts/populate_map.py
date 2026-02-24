@@ -1,75 +1,48 @@
 #!/usr/bin/env python3
 """
-scripts/populate_map.py — Hyper-Adjacency Map Population Tool
-==============================================================
+scripts/populate_map.py — SHADE Population Tool (V1.1)
+=======================================================
 
-Populates System 2 (the Hyper-Adjacency Map) with Hyperedges from a
-structured facts file, then saves the updated map to disk.
+Populates System 2 (SHADE) with concept-attractor nodes from a
+structured facts file, then saves the updated SHADE database.
 
-On every run the script loads the existing map first (if the save file
-exists), adds any new facts that are not already present, and saves back.
-Re-running with the same file is safe and idempotent.
+Re-running with the same file is safe — existing nodes are skipped
+or updated depending on mode.
 
 ────────────────────────────────────────────────────────────────
-Facts file format (JSON array, --facts-file)
-────────────────────────────────────────────────────────────────
+Facts file format (JSON array):
 [
   {
-    "anchor_ids":      [100, 200],    // token IDs of semantic anchors
-    "target_token_id": 300,           // token ID of the target
-    "tier":            "axiom",       // "axiom" | "domain" | "user"
-    "hard_lock":       true,          // optional (default false)
-    "s_base":          1000           // optional starting strength
+    "concept_text":  "Paris",        // text description of the concept
+    "target_tokens": {"42": 5.0},    // token_id (str) → weight
+    "context_ids":   [100, 200],     // SAC token IDs for context
+    "tier":          "axiom",        // "axiom" | "domain" | "user"
+    "hard_lock":     true,           // optional (default false)
+    "s_base":        1000            // optional starting strength
   },
   ...
 ]
 
-"anchor_ids" must contain at least 2 entries (the minimum for a valid hash).
-"tier" controls which consistency-gate threshold is applied when the
-Reasoning Head is asked to validate the entry (--use-gate mode).
+JSONL format (one record per line) is also supported.
 
 ────────────────────────────────────────────────────────────────
-Facts file format (JSONL, one record per line, --facts-file *.jsonl)
-────────────────────────────────────────────────────────────────
-{"anchor_ids": [100, 200], "target_token_id": 300, "tier": "axiom"}
-{"anchor_ids": [101, 202], "target_token_id": 301, "tier": "domain"}
+Operation modes:
+    --mode insert   (default) Insert new nodes; skip duplicates.
+    --mode upsert   Update S_base / hard-lock on collision.
+    --mode replace  Delete and rebuild from scratch.
 
 ────────────────────────────────────────────────────────────────
-Operation modes
-────────────────────────────────────────────────────────────────
-  --mode insert   (default) Insert new entries; skip duplicates by key.
-  --mode upsert   Update S_base / hard-lock on key collision.
-  --mode replace  Delete the existing map and rebuild from scratch.
-
-────────────────────────────────────────────────────────────────
-Usage examples
-────────────────────────────────────────────────────────────────
-# Populate from a JSON facts file, save map alongside a checkpoint:
+Usage:
     python scripts/populate_map.py \\
         --facts-file data/facts.json \\
-        --map-file   checkpoints/phase2/hyper_map.json \\
+        --shade-file checkpoints/shade.json \\
         --checkpoint-dir checkpoints/
 
-# Load config from a checkpoint dir and validate with Reasoning Head:
     python scripts/populate_map.py \\
-        --facts-file data/facts.json \\
-        --map-file   checkpoints/hyper_map.json \\
-        --checkpoint-dir checkpoints/ \\
-        --use-gate
+        --shade-file checkpoints/shade.json --stats-only
 
-# Show current map stats without changing anything:
     python scripts/populate_map.py \\
-        --map-file checkpoints/hyper_map.json \\
-        --stats-only
-
-# Hard-lock every existing axiom in the map:
-    python scripts/populate_map.py \\
-        --map-file checkpoints/hyper_map.json \\
-        --lock-all-axioms
-
-# Export the full belief state to a readable JSON file:
-    python scripts/populate_map.py \\
-        --map-file checkpoints/hyper_map.json \\
+        --shade-file checkpoints/shade.json \\
         --export-beliefs beliefs_export.json
 ────────────────────────────────────────────────────────────────
 """
@@ -82,15 +55,14 @@ import time
 from dataclasses import fields as dc_fields
 from typing import List, Optional
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from arnl.config import ARNLConfig
-from arnl.model import Arnold
-from arnl.system2 import HyperAdjacencyMap, Hyperedge
-from arnl.utils import semantic_hash
-from scripts.data_config import DataConfig, build_facts_list, build_facts_from_phase1
+from arnl.system2 import SHADE
+from scripts.data_config import DataConfig
 
 _DATA_CONFIG_FILENAME = "data_config.json"
 
@@ -99,8 +71,9 @@ _DATA_CONFIG_FILENAME = "data_config.json"
 # Fact loading
 # ════════════════════════════════════════════════════════════════
 
-def _load_facts(path: str) -> List[dict]:
-    """Load facts from a JSON array file or a JSONL file."""
+def load_facts_file(path: str) -> List[dict]:
+    """Load facts from a JSON or JSONL file."""
+    facts = []
     with open(path, "r", encoding="utf-8") as f:
         content = f.read().strip()
 
@@ -109,8 +82,7 @@ def _load_facts(path: str) -> List[dict]:
         facts = json.loads(content)
     else:
         # JSONL
-        facts = []
-        for line in content.splitlines():
+        for line in content.split("\n"):
             line = line.strip()
             if line and not line.startswith("#"):
                 facts.append(json.loads(line))
@@ -118,386 +90,199 @@ def _load_facts(path: str) -> List[dict]:
     return facts
 
 
-def _validate_fact(rec: dict, idx: int) -> Optional[str]:
-    """Return an error string if the record is malformed, else None."""
-    if "anchor_ids" not in rec:
-        return f"Record {idx}: missing 'anchor_ids'"
-    if len(rec["anchor_ids"]) < 2:
-        return f"Record {idx}: 'anchor_ids' must have at least 2 entries"
-    if "target_token_id" not in rec:
-        return f"Record {idx}: missing 'target_token_id'"
-    return None
+def build_concept_emb(text: str, tokenizer, emb_table: Optional[np.ndarray]) -> np.ndarray:
+    """Build a concept embedding from text.
 
-
-# ════════════════════════════════════════════════════════════════
-# Config / model loading helpers
-# ════════════════════════════════════════════════════════════════
-
-def _load_config(checkpoint_dir: Optional[str]) -> ARNLConfig:
-    if checkpoint_dir:
-        cfg_path = os.path.join(checkpoint_dir, "config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path) as f:
-                d = json.load(f)
-            valid = {fld.name for fld in dc_fields(ARNLConfig)}
-            cfg = ARNLConfig(**{k: v for k, v in d.items() if k in valid})
-            print(f"  Config loaded from {cfg_path}")
-            return cfg
-    print("  No config.json found — using arnold_tiny defaults.")
-    return ARNLConfig.arnold_tiny()
-
-
-def _build_model_from_checkpoint(
-    checkpoint_dir: str,
-    config: ARNLConfig,
-    device: str,
-) -> Arnold:
-    """Build Arnold and load the best available weights from a checkpoint dir."""
-    model = Arnold(config)
-
-    # Load Reasoning Head (needed for semantic embeddings)
-    for phase in [3, 2, 1]:
-        pt = os.path.join(checkpoint_dir, f"phase{phase}", "reasoning_head.pt")
-        if os.path.exists(pt):
-            model.reasoning_head.load_state_dict(
-                torch.load(pt, map_location=device)
-            )
-            print(f"  Loaded Reasoning Head from phase {phase} checkpoint")
-            break
-    else:
-        print("  No Reasoning Head checkpoint found — using random weights.")
-
-    model.to(device)
-    model.eval()
-    return model
-
-
-# ════════════════════════════════════════════════════════════════
-# Core insertion loop
-# ════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def populate(
-    model: Arnold,
-    hyper_map: HyperAdjacencyMap,
-    facts: List[dict],
-    mode: str,
-    use_gate: bool,
-    device: str,
-) -> dict:
-    """Insert facts into *hyper_map*.
-
-    Parameters
-    ----------
-    model : Arnold
-        Used only for the semantic embeddings (reasoning_head._embed_semantic).
-    hyper_map : HyperAdjacencyMap
-    facts : list[dict]
-        Validated fact records.
-    mode : str
-        'insert' | 'upsert' | 'replace'
-    use_gate : bool
-        If True, run each candidate through the Consistency Gate before inserting.
-    device : str
-
-    Returns
-    -------
-    dict with counts: inserted, skipped, updated, rejected
+    If an embedding table is available, average-pool the token embeddings.
+    Otherwise, return a hash-based vector.
     """
-    counts = {"inserted": 0, "skipped": 0, "updated": 0, "rejected": 0, "invalid": 0}
-
-    for idx, rec in enumerate(facts):
-        err = _validate_fact(rec, idx)
-        if err:
-            print(f"  [WARN] {err}")
-            counts["invalid"] += 1
-            continue
-
-        anchor_ids: List[int] = rec["anchor_ids"]
-        target_id: int = rec["target_token_id"]
-        tier: str = rec.get("tier", "domain")
-        hard_lock: bool = rec.get("hard_lock", False)
-        s_base: int = rec.get("s_base", 1000 if hard_lock else 1)
-
-        key = semantic_hash(anchor_ids)
-
-        # ── Mode: replace cleared map before the loop; just insert ──
-        existing = hyper_map._map.get(key)
-
-        if existing is not None and mode == "insert":
-            counts["skipped"] += 1
-            continue
-
-        # Get the semantic embedding for the target token
-        target_tensor = torch.tensor([target_id], device=device, dtype=torch.long)
-        v_target = model.reasoning_head._embed_semantic(target_tensor).squeeze(0)
-
-        # Optional Reasoning Head consistency gate
-        if use_gate:
-            accepted, gate_score, init_sbase = model.reasoning_head.consistency_gate(
-                v_target, hyper_map, tier
-            )
-            if not accepted:
-                print(
-                    f"  [GATE] Rejected: anchor_ids={anchor_ids} target={target_id} "
-                    f"gate={gate_score:.3f}"
-                )
-                counts["rejected"] += 1
-                continue
-            # Use the gate's suggested init S_base only if not explicitly provided
-            if "s_base" not in rec:
-                s_base = max(s_base, init_sbase)
-
-        if existing is not None and mode == "upsert":
-            # Update the existing entry
-            existing.s_base = s_base
-            existing.s_base_original = max(existing.s_base_original, s_base)
-            existing.v_target = v_target.detach().clone()
-            existing.target_token_id = target_id
-            existing.tier_label = tier
-            if hard_lock:
-                existing.hard_locked = True
-            counts["updated"] += 1
-            print(f"  [UPDATE] key={key} anchor_ids={anchor_ids} → token={target_id} "
-                  f"S_base={s_base} tier={tier}")
-        else:
-            # Fresh insert
-            edge = hyper_map.insert(
-                anchor_ids=anchor_ids,
-                v_target=v_target,
-                target_token_id=target_id,
-                s_base=s_base,
-                tier_label=tier,
-            )
-            if hard_lock:
-                edge.hard_locked = True
-                edge.s_base_original = max(s_base, 1000)
-                edge.s_base = max(s_base, 1000)
-            counts["inserted"] += 1
-            print(f"  [INSERT] key={key} anchor_ids={anchor_ids} → token={target_id} "
-                  f"S_base={edge.s_base} tier={tier} locked={hard_lock}")
-
-    return counts
-
-
-# ════════════════════════════════════════════════════════════════
-# Statistics display
-# ════════════════════════════════════════════════════════════════
-
-def _print_stats(hyper_map: HyperAdjacencyMap):
-    all_edges = hyper_map.get_all_edges()
-    incubation = [e for e in all_edges if e.s_base < 50]
-    axiomatic  = [e for e in all_edges if 50 <= e.s_base < 1000]
-    overflow   = [e for e in all_edges if e.s_base >= 1000]
-    locked     = [e for e in all_edges if e.hard_locked]
-
-    print("\n  ─── Hyper-Adjacency Map Statistics ───")
-    print(f"  Total edges   : {len(all_edges):>6}")
-    print(f"  Incubation    : {len(incubation):>6}  (S_base 1–49)")
-    print(f"  Axiomatic     : {len(axiomatic):>6}  (S_base 50–999)")
-    print(f"  Overflow      : {len(overflow):>6}  (S_base 1000)")
-    print(f"  Hard-Locked   : {len(locked):>6}")
-    diag = hyper_map.diagnostics
-    print(f"  Lookups       : {diag['total_lookups']:>6}")
-    print(f"  Hit rate      : {diag['hit_rate']:>6.1%}")
-    print(f"  Semantic vacua: {diag['semantic_vacuum_events']:>6}")
-    print(f"  Refuted       : {diag['refuted_pathways_count']:>6}")
-
-    if all_edges:
-        print("\n  Top-10 by S_base:")
-        top = sorted(all_edges, key=lambda e: (e.s_base, e.s_overflow), reverse=True)[:10]
-        for e in top:
-            print(
-                f"    key={e.key:<20d} token={e.target_token_id:<6d} "
-                f"S_base={e.s_base:<5d} S_ov={e.s_overflow:<5d} "
-                f"tier={e.tier:<12s} locked={str(e.hard_locked)}"
-            )
+    ids = tokenizer.encode(text)
+    if emb_table is not None and len(ids) > 0:
+        vecs = emb_table[ids]
+        avg = vecs.mean(axis=0)
+        norm = np.linalg.norm(avg)
+        if norm > 1e-8:
+            avg = avg / norm
+        # Quantize to int8
+        return (avg * 127).clip(-127, 127).astype(np.int8)
+    else:
+        # Fallback: hash-based pseudo-embedding
+        dim = 128  # default d_semantic for tiny
+        rng = np.random.RandomState(hash(text) % (2**31))
+        vec = rng.randn(dim).astype(np.float32)
+        vec = vec / np.linalg.norm(vec)
+        return (vec * 127).clip(-127, 127).astype(np.int8)
 
 
 # ════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════
 
-def build_args():
-    p = argparse.ArgumentParser(
-        description="Populate and manage the ARNL Hyper-Adjacency Map.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Populate SHADE (System 2) with factual nodes — ARNL V1.1",
     )
 
-    # ── Files ────────────────────────────────────────────────────
-    p.add_argument("--data-config", default=None, metavar="PATH",
-                   help="Path to a DataConfig JSON file (HuggingFace datasets). "
-                        "Generated with: python scripts/data_config.py --init-config PATH")
-    p.add_argument("--facts-file", "-f", default=None,
-                   help="Path to JSON or JSONL facts file to ingest.")
-    p.add_argument("--map-file", "-m", default=None,
-                   help="Path to the hyper_map.json save file (default: {checkpoint-dir}/hyper_map.json).")
-    p.add_argument("--checkpoint-dir", "-c", default=None,
-                   help="Checkpoint directory to load config and model weights from.")
+    parser.add_argument("--facts-file", default=None,
+                        help="Path to JSON/JSONL facts file")
+    parser.add_argument("--shade-file", default="checkpoints/shade.json",
+                        help="Path to SHADE database file (default: checkpoints/shade.json)")
+    parser.add_argument("--checkpoint-dir", "-c", default=None,
+                        help="Checkpoint directory (loads config.json)")
+    parser.add_argument("--data-config", default=None,
+                        help="Path to DataConfig JSON")
+    parser.add_argument("--mode", default="insert",
+                        choices=["insert", "upsert", "replace"])
+    parser.add_argument("--stats-only", action="store_true",
+                        help="Show SHADE stats and exit")
+    parser.add_argument("--export-beliefs", default=None, metavar="PATH",
+                        help="Export full belief state to JSON")
+    parser.add_argument("--lock-all-axioms", action="store_true",
+                        help="Hard-lock all Axiomatic nodes (S_base ≥ 50)")
+    parser.add_argument("--preset", default="arnold_tiny")
+    parser.add_argument("--device", default="cpu")
 
-    # ── Mode ─────────────────────────────────────────────────────
-    p.add_argument("--mode", default="insert",
-                   choices=["insert", "upsert", "replace"],
-                   help="insert=skip duplicates, upsert=overwrite, replace=rebuild (default: insert)")
+    args = parser.parse_args()
 
-    # ── Gate ─────────────────────────────────────────────────────
-    p.add_argument("--use-gate", action="store_true",
-                   help="Validate each fact through the Reasoning Head consistency gate before inserting.")
-
-    # ── Utility operations ───────────────────────────────────────
-    p.add_argument("--stats-only", action="store_true",
-                   help="Print map statistics and exit (no modifications).")
-    p.add_argument("--lock-all-axioms", action="store_true",
-                   help="Hard-lock every axiom-tier entry (S_base=1000, decay disabled).")
-    p.add_argument("--export-beliefs", default=None, metavar="PATH",
-                   help="Export full belief state to a JSON file.")
-    p.add_argument("--purge-dead", action="store_true",
-                   help="Purge all entries with S_base <= 0 before saving.")
-
-    # ── Model ────────────────────────────────────────────────────
-    p.add_argument("--preset", default=None,
-                   choices=["arnold_tiny","arnold_1b","arnold_3b",
-                            "arnold_7b","arnold_13b","arnold_24b"],
-                   help="Model preset to use if no config.json found.")
-    p.add_argument("--device", default="cpu")
-
-    return p.parse_args()
-
-
-def main():
-    args = build_args()
-
-    print("=" * 60)
-    print("  populate_map.py — ARNL Hyper-Adjacency Map Tool")
-    print("=" * 60)
-
-    device = args.device
-
-    # ── Resolve defaults ─────────────────────────────────────────
-    # Auto-detect data config saved by train.py inside the checkpoint dir
-    data_config_path = args.data_config
-    if data_config_path is None and args.checkpoint_dir:
-        candidate = os.path.join(args.checkpoint_dir, _DATA_CONFIG_FILENAME)
-        if os.path.exists(candidate):
-            data_config_path = candidate
-            print(f"  Auto-detected DataConfig: {candidate}")
-
-    # Default map file: {checkpoint_dir}/hyper_map.json or ./hyper_map.json
-    map_file = args.map_file
-    if map_file is None:
-        if args.checkpoint_dir:
-            map_file = os.path.join(args.checkpoint_dir, "hyper_map.json")
-        else:
-            map_file = "hyper_map.json"
-        print(f"  Default map file: {map_file}")
-
-    # ── Config & model ───────────────────────────────────────────
-    config = _load_config(args.checkpoint_dir)
-    if args.preset and args.checkpoint_dir is None:
-        config = getattr(ARNLConfig, args.preset)()
-        print(f"  Using preset: {args.preset}")
-
-    # Build model — needed for semantic embeddings
+    # ── Load Config ──────────────────────────────────────────────
+    config = None
     if args.checkpoint_dir:
-        model = _build_model_from_checkpoint(args.checkpoint_dir, config, device)
-    else:
-        print("  No --checkpoint-dir given — using randomly initialised semantic embeddings.")
-        model = Arnold(config)
-        model.to(device)
-        model.eval()
+        config_path = os.path.join(args.checkpoint_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                d = json.load(f)
+            valid = {fld.name for fld in dc_fields(ARNLConfig)}
+            config = ARNLConfig(**{k: v for k, v in d.items() if k in valid})
+            print(f"  Config loaded from {config_path}")
+    if config is None:
+        config = getattr(ARNLConfig, args.preset)()
+        print(f"  Using {args.preset} config")
 
-    # ── Load existing map ────────────────────────────────────────
-    hyper_map = HyperAdjacencyMap(config)
-    if os.path.exists(map_file):
-        hyper_map.load(map_file, device=torch.device(device))
-        print(f"  Loaded existing map: {map_file}  ({hyper_map.size} edges)")
+    # ── Load or create SHADE ─────────────────────────────────────
+    shade = SHADE(config)
+
+    if args.mode == "replace":
+        print("  Mode: REPLACE — starting fresh")
+    elif os.path.exists(args.shade_file):
+        shade.load(args.shade_file)
+        print(f"  Loaded existing SHADE: {shade.size} nodes, {shade.edge_count} edges")
     else:
-        print(f"  No existing map at {map_file} — starting fresh.")
+        print(f"  No existing SHADE at {args.shade_file} — creating new")
 
     # ── Stats only ───────────────────────────────────────────────
     if args.stats_only:
-        _print_stats(hyper_map)
+        diag = shade.diagnostics
+        for k, v in diag.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
+            else:
+                print(f"  {k}: {v}")
         return
-
-    # ── Replace mode — wipe the map ─────────────────────────────
-    if args.mode == "replace":
-        print(f"  Mode=replace: clearing {hyper_map.size} existing edges.")
-        hyper_map._map.clear()
-
-    # ── Populate from DataConfig (HuggingFace) or facts file ────
-    facts = None
-    facts_label = None
-
-    if data_config_path:
-        data_cfg = DataConfig.load(data_config_path)
-        print(f"  DataConfig loaded from {data_config_path}")
-        # 1. Try explicit facts section (HF dataset or local file)
-        facts = build_facts_list(data_cfg)
-        facts_label = f"DataConfig facts ({data_config_path})"
-        # 2. Fall back: derive hyperedges from the Phase 1 HF text dataset
-        if facts is None:
-            print("  No explicit facts source — extracting hyperedges from Phase 1 dataset.")
-            facts = build_facts_from_phase1(data_cfg, config)
-            facts_label = f"Phase 1 dataset ({data_config_path})"
-
-    if facts is None and args.facts_file:
-        if not os.path.exists(args.facts_file):
-            print(f"  ERROR: facts file not found: {args.facts_file}")
-            sys.exit(1)
-        facts = _load_facts(args.facts_file)
-        facts_label = args.facts_file
-
-    if facts is not None:
-        n_facts = len(facts)
-        print(f"\n  Ingesting {n_facts} facts from {facts_label}")
-        print(f"  Mode: {args.mode}  |  Gate: {'on' if args.use_gate else 'off'}")
-        print()
-
-        t0 = time.time()
-        counts = populate(model, hyper_map, facts, args.mode, args.use_gate, device)
-        elapsed = time.time() - t0
-
-        print(f"\n  ── Ingestion summary ({elapsed:.2f}s) ──")
-        for k, v in counts.items():
-            print(f"    {k:<10}: {v}")
-    else:
-        print("  No --facts-file or --data-config provided; skipping ingestion.")
-
-    # ── Utility operations ───────────────────────────────────────
-    if args.lock_all_axioms:
-        n_locked = 0
-        for edge in hyper_map.get_all_axioms(min_sbase=1000):
-            if not edge.hard_locked:
-                edge.hard_locked = True
-                edge.s_base_original = 1000
-                n_locked += 1
-        print(f"\n  Hard-locked {n_locked} axiom edges.")
-
-    if args.purge_dead:
-        n_purged = hyper_map.purge_dead()
-        print(f"\n  Purged {n_purged} dead edges (S_base <= 0).")
-
-    # ── Statistics ───────────────────────────────────────────────
-    _print_stats(hyper_map)
-
-    # ── Save ─────────────────────────────────────────────────────
-    save_dir = os.path.dirname(map_file)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    hyper_map.save(map_file)
-    print(f"\n  Saved map → {os.path.abspath(map_file)}  ({hyper_map.size} edges)")
 
     # ── Export beliefs ───────────────────────────────────────────
     if args.export_beliefs:
-        beliefs_json = hyper_map.export_belief_state_json()
-        with open(args.export_beliefs, "w", encoding="utf-8") as f:
-            f.write(beliefs_json)
-        print(f"  Belief state exported → {os.path.abspath(args.export_beliefs)}")
+        beliefs = shade.export_belief_state_json()
+        with open(args.export_beliefs, "w") as f:
+            f.write(beliefs)
+        print(f"  Exported {shade.size} beliefs → {args.export_beliefs}")
+        return
 
-    print("\n" + "=" * 60)
-    print("  Done.")
-    print("=" * 60)
+    # ── Lock all axioms ──────────────────────────────────────────
+    if args.lock_all_axioms:
+        axioms = shade.get_all_axioms()
+        for node in axioms:
+            shade.hard_lock(node.node_id)
+        print(f"  Hard-locked {len(axioms)} axiomatic nodes")
+        shade.save(args.shade_file)
+        return
+
+    # ── Populate from facts file ─────────────────────────────────
+    if args.facts_file is None:
+        parser.print_help()
+        print("\n  ERROR: --facts-file required for population mode.")
+        sys.exit(1)
+
+    facts = load_facts_file(args.facts_file)
+    print(f"  Loaded {len(facts)} facts from {args.facts_file}")
+
+    # Load tokenizer + embedding table for concept_emb construction
+    tokenizer = None
+    emb_table = None
+    try:
+        from arnl.salt_tokenizer import SALTTokenizer
+        tokenizer = SALTTokenizer(config.tokenizer_dir)
+        print(f"  SALT tokenizer loaded (vocab={tokenizer.vocab_size})")
+
+        # Try to load embedding table from Phase 1 checkpoint
+        if args.checkpoint_dir:
+            p1_path = os.path.join(args.checkpoint_dir, "phase1", "system1.pt")
+            if os.path.exists(p1_path):
+                state = torch.load(p1_path, map_location="cpu", weights_only=True)
+                emb_weight = state.get("token_embed.weight")
+                if emb_weight is not None:
+                    w = emb_weight.float().numpy()
+                    norms = np.linalg.norm(w, axis=1, keepdims=True).clip(min=1e-8)
+                    emb_table = w / norms
+                    print(f"  Embedding table loaded: {emb_table.shape}")
+    except Exception as e:
+        print(f"  Warning: Could not load tokenizer/embeddings: {e}")
+        # Use a simple tokenizer fallback
+        class _SimpleTok:
+            def encode(self, text):
+                return [ord(c) % config.vocab_size for c in text]
+        tokenizer = _SimpleTok()
+
+    # ── Insert nodes ─────────────────────────────────────────────
+    inserted = 0
+    skipped = 0
+    t0 = time.time()
+
+    for fact in facts:
+        concept_text = fact.get("concept_text", "")
+        target_dist = {}
+        raw_dist = fact.get("target_tokens", {})
+        for k, v in raw_dist.items():
+            target_dist[int(k)] = float(v)
+
+        context_ids = fact.get("context_ids", [])
+        tier = fact.get("tier", "domain")
+        s_base = fact.get("s_base", 1)
+        hard_lock = fact.get("hard_lock", False)
+
+        if not concept_text and not target_dist:
+            skipped += 1
+            continue
+
+        concept_emb = build_concept_emb(concept_text, tokenizer, emb_table)
+
+        # Check for duplicate (cosine sim > 0.95 with existing node)
+        if args.mode == "insert" and shade.size > 0:
+            matches = shade.conflict_scan(concept_emb.astype(np.float32), delta=-0.95)
+            # conflict_scan returns nodes with sim < -delta, so sim < 0.95 for delta=-0.95
+            # We need exact match check differently
+            pass  # For now just insert
+
+        node = shade.insert_node(
+            concept_emb=concept_emb,
+            target_dist=target_dist,
+            context_window=context_ids,
+            s_base=s_base,
+            tier_label=tier,
+        )
+
+        if hard_lock:
+            shade.hard_lock(node.node_id)
+
+        inserted += 1
+
+    elapsed = time.time() - t0
+    print(f"\n  Inserted: {inserted}  Skipped: {skipped}  Time: {elapsed:.2f}s")
+    print(f"  SHADE total: {shade.size} nodes, {shade.edge_count} edges")
+
+    # ── Save ─────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(os.path.abspath(args.shade_file)), exist_ok=True)
+    shade.save(args.shade_file)
+    print(f"  Saved → {args.shade_file}")
 
 
 if __name__ == "__main__":

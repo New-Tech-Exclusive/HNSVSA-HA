@@ -5,37 +5,24 @@ ARNL — Axiomatic-Recurrent Neural Logic
 A Neuro-Symbolic Replacement Architecture for Small Language Models.
 
 Model Name: Arnold
-Architecture: ARNL V1.0
+Architecture: ARNL V1.1 — SHADE Edition
 Parameter Range: 1B – 24B+
-Target: High-Stakes Factual Domains and General-Purpose Factual AI
 
-Core Design Principle:
-    System 1 determines HOW something is said.
-    System 2 determines WHAT is said.
-    The Reasoning Head determines WHETHER and WHEN System 2 influences System 1.
+Core Design Principle (V1.1):
+    System 1 determines HOW something is said and SIGNALS when it
+    does not know WHAT.
+    SHADE (System 2) determines WHAT is said whenever System 1
+    signals uncertainty.
+    No controller mediates between them.
 """
 
 from arnl.config import ARNLConfig
 from arnl.model import Arnold
 from arnl.system1 import LLSU, LLSUBlock, GLALayer
-from arnl.system2 import HyperAdjacencyMap, Hyperedge
-from arnl.reasoning_head import ReasoningHead
-from arnl.injection_bridge import InjectionBridge
+from arnl.system2 import SHADE, ShadeNode, ShadeEdge
 from arnl.decay_engine import DecayEngine
+from arnl.salt_tokenizer import SALTTokenizer, SALTEncoding, TokenClass
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __model_name__ = "Arnold"
 __arch_name__ = "ARNL"
-
-__all__ = [
-    "ARNLConfig",
-    "Arnold",
-    "LLSU",
-    "LLSUBlock",
-    "GLALayer",
-    "HyperAdjacencyMap",
-    "Hyperedge",
-    "ReasoningHead",
-    "InjectionBridge",
-    "DecayEngine",
-]

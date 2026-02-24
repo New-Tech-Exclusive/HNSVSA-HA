@@ -37,9 +37,7 @@ Config file format  (save with --init-config / DataConfig.save())
     "local_file":      null
   },
 
-  "phase3": {
-    "local_file": "data/finetune.jsonl"            // can mix HF + local per phase
-  },
+  // Phase 3 removed in V1.1 — only 2 training phases
 
   "facts": {
     "hf_dataset":          "my_org/knowledge_base",
@@ -65,7 +63,7 @@ Quick-start — generate an example config then train:
 
 Or for map population:
     python scripts/populate_map.py --data-config data/my_data.json \\
-        --map-file ckpt/hyper_map.json --checkpoint-dir ckpt/
+        --shade-file ckpt/shade.json --checkpoint-dir ckpt/
 ────────────────────────────────────────────────────────────────
 """
 
@@ -119,7 +117,7 @@ class Phase1DataCfg:
 
 @dataclass
 class Phase23DataCfg:
-    """Data source for Phase 2 or Phase 3 training."""
+    """Data source for Phase 2 training (Phase 3 removed in V1.1)."""
 
     # HuggingFace source
     hf_dataset: Optional[str] = None
@@ -190,11 +188,12 @@ class DataConfig:
     """Shared HuggingFace tokenizer name/path (e.g. 'gpt2', 'bert-base-uncased').
     Overridden by per-phase *tokenizer_name* settings."""
 
-    max_seq_len: int = 512
+    max_seq_len: int = 2048
     """Maximum sequence length fed to the model."""
 
     phase1: Phase1DataCfg = field(default_factory=Phase1DataCfg)
     phase2: Phase23DataCfg = field(default_factory=Phase23DataCfg)
+    # phase3 removed in V1.1 — kept for config compat but unused
     phase3: Phase23DataCfg = field(default_factory=Phase23DataCfg)
     facts: FactsDataCfg = field(default_factory=FactsDataCfg)
 
@@ -231,7 +230,7 @@ class DataConfig:
     def example(cls) -> "DataConfig":
         """Return an annotated example config (good starting point for editing)."""
         return cls(
-            tokenizer_name="gpt2",
+            tokenizer_name="salt",
             max_seq_len=512,
             phase1=Phase1DataCfg(
                 hf_dataset="wikitext",
@@ -287,9 +286,33 @@ def _require_transformers():
 
 
 def _load_tokenizer(name: Optional[str], *, silent: bool = False):
-    """Load a HuggingFace tokenizer by name, or return None."""
+    """Load a tokenizer by name or path.
+
+    Supports:
+      - ``"salt:<dir>"``  → SALTTokenizer from that directory
+      - ``"salt"``        → SALTTokenizer from ``tokenizer/``
+      - Any other string  → HuggingFace AutoTokenizer
+    """
     if name is None:
         return None
+
+    # SALT tokenizer
+    if name.startswith("salt"):
+        parts = name.split(":", 1)
+        salt_dir = parts[1] if len(parts) > 1 else "tokenizer/"
+        tok_path = os.path.join(salt_dir, "tokenizer.json")
+        if os.path.exists(tok_path):
+            from arnl.salt_tokenizer import SALTTokenizer
+            tok = SALTTokenizer(salt_dir)
+            if not silent:
+                print(f"  [data_config] Loaded SALT tokenizer from {salt_dir}")
+            return tok
+        else:
+            if not silent:
+                print(f"  [data_config] WARNING: SALT tokenizer not found at {salt_dir}")
+            return None
+
+    # HuggingFace tokenizer
     AutoTokenizer = _require_transformers()
     try:
         tok = AutoTokenizer.from_pretrained(name)
@@ -517,13 +540,13 @@ def build_phase23_dataset(
     phase: int,
     arnl_config: ARNLConfig,
 ) -> Optional[Dataset]:
-    """Build a Phase 2 or Phase 3 dataset from *data_cfg*.
+    """Build a Phase 2 dataset from *data_cfg*.
 
     Parameters
     ----------
     data_cfg : DataConfig
     phase : int
-        2 or 3.
+        2 (Phase 3 removed in V1.1).
     arnl_config : ARNLConfig
 
     Returns ``None`` if neither HF nor local source is configured.
@@ -642,7 +665,7 @@ def build_facts_from_phase1(
     arnl_config: "ARNLConfig",
     max_facts: Optional[int] = None,
 ) -> Optional[List[dict]]:
-    """Extract hyperedge facts from the Phase 1 text dataset via sliding windows.
+    """Extract SHADE node facts from the Phase 1 text dataset via sliding windows.
 
     Loads the same text corpus used for Phase 1 EMLM pretraining, tokenizes
     each document, then slides a window of ``(k_anchors + 1)`` tokens across
@@ -675,7 +698,7 @@ def build_facts_from_phase1(
     window = k + 1
     limit = max_facts or data_cfg.facts.hf_max_samples
 
-    print(f"  [data_config] Extracting hyperedges from {len(texts):,} Phase 1 documents"
+    print(f"  [data_config] Extracting SHADE facts from {len(texts):,} Phase 1 documents"
           f" (k_anchors={k}, limit={limit or 'none'}) …")
 
     facts: List[dict] = []
@@ -699,7 +722,7 @@ def build_facts_from_phase1(
         if limit and len(facts) >= limit:
             break
 
-    print(f"  [data_config] Extracted {len(facts):,} hyperedge facts from Phase 1 dataset.")
+    print(f"  [data_config] Extracted {len(facts):,} SHADE facts from Phase 1 dataset.")
     return facts
 
 
@@ -728,7 +751,7 @@ def _cli():
         cfg.save(args.init_config)
         print("  Edit the file to point at your datasets, then pass it to train.py / populate_map.py:")
         print(f"    python scripts/train.py --data-config {args.init_config} --checkpoint-dir ckpt/")
-        print(f"    python scripts/populate_map.py --data-config {args.init_config} --map-file ckpt/map.json")
+        print(f"    python scripts/populate_map.py --data-config {args.init_config} --shade-file ckpt/shade.json")
         return
 
     if args.show_config:

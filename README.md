@@ -1,4 +1,8 @@
-# Arnold — ARNL V1.0
+# Arnold — ARNL V1.1
+
+## NOTE
+
+I am abandoning this arch in search of something simpler, but with a similar philosophy. Make Small language Models actually viable, safe, private and legal options in the AI space. This README is not up-to-date, please refer to the ARNL 1.1 spec sheet for how the arch really works.
 
 **Arnold** is a neuro-symbolic language model implementing the **ARNL** (Axiomatic-Recurrent Neural Logic) architecture. It pairs a neural fluency backbone with a non-neural factual memory system to produce outputs that are both fluent and verifiably grounded.
 

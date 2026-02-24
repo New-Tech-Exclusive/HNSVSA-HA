@@ -1,14 +1,17 @@
 """
-ARNL Configuration
-==================
+ARNL V1.1 Configuration
+========================
 
-All hyperparameters for the Arnold architecture. Includes preset
-configurations for different parameter scales (1B through 24B+).
+All hyperparameters for the Arnold architecture (SHADE Edition).
 
-Parameter Budget Philosophy (80/15/5):
-    System 1 (LLSU):        ~80% — fluency backbone
-    Reasoning Head:         ~15% — control logic + classifier
-    Injection Bridge W_proj: ~5% — semantic-to-syntactic projection
+V1.1 eliminates the Reasoning Head and W_proj Injection Bridge.
+Gap detection is driven by System 1's output entropy over SAC tokens.
+Factual injection operates directly at the logit layer via SHADE.
+
+Parameter Budget Philosophy (~95 / ~5):
+    System 1 (LLSU):  ~95% of total params — fluency backbone + gap detection
+    Infrastructure:    ~5% — SALT embeddings
+    SHADE:            Off-budget (database, no trainable parameters)
 """
 
 from __future__ import annotations
@@ -19,12 +22,12 @@ from typing import Optional, List
 
 @dataclass
 class ARNLConfig:
-    """Full configuration for the ARNL architecture."""
+    """Full configuration for the ARNL V1.1 architecture."""
 
     # ── Model Identity ──────────────────────────────────────────────
     model_name: str = "Arnold"
     arch_name: str = "ARNL"
-    version: str = "1.0"
+    version: str = "1.1"
 
     # ── Vocabulary ──────────────────────────────────────────────────
     vocab_size: int = 32_000
@@ -33,69 +36,62 @@ class ARNLConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
 
+    # ── Tokenizer ───────────────────────────────────────────────────
+    tokenizer_type: str = "salt"
+    tokenizer_dir: str = "tokenizer/"
+
     # Entity-mask special tokens (EMLM training)
     entity_tokens: List[str] = field(default_factory=lambda: [
-        "[ENTITY_NOUN]",     # Proper nouns (people, places)
-        "[ENTITY_NUM]",      # Numerical data (dates, quantities)
-        "[ENTITY_CONCEPT]",  # Named concepts (products, events)
-        "[ENTITY_DOMAIN]",   # Domain-specific terms
+        "[ENTITY_NOUN]",
+        "[ENTITY_NUM]",
+        "[ENTITY_CONCEPT]",
+        "[ENTITY_DOMAIN]",
     ])
 
     # ── System 1 — LLSU (Gated Linear Attention / SSM) ──────────
-    # ~80 % of total parameter budget
-    d_model: int = 2048        # Hidden dimension
-    n_layers: int = 24         # Number of LLSU blocks
-    d_ffn: int = 5504          # SwiGLU intermediate dimension
-    d_state: int = 256         # GLA/SSM recurrent state width
-    n_heads: int = 16          # Number of GLA heads
+    d_model: int = 2048
+    n_layers: int = 24
+    d_ffn: int = 5504
+    d_state: int = 256
+    n_heads: int = 16
 
-    # ── System 2 — Hyper-Adjacency Map ──────────────────────────
-    # Off-budget (non-neural hash map)
-    d_semantic: int = 768      # Frozen semantic embedding dimension
-    k_anchors: int = 5         # Semantic anchors per lookup
+    # ── Gap Detection (replaces Reasoning Head) ─────────────────
+    h_gap: float = 2.0         # Shannon entropy threshold (nats) over SAC tokens
+
+    # ── System 2 — SHADE ────────────────────────────────────────
+    # Off-budget (non-neural database)
+    d_semantic: int = 768      # Frozen SALT semantic embedding dimension
+    shade_top_m: int = 16      # Nearest-neighbor candidates per retrieval
+    shade_top_k: int = 8       # Top-K tokens stored per node target_dist
+    shade_context_k: int = 8   # Recent SAC tokens for context fingerprint
+    shade_sim_min: float = 0.65  # Min similarity for retrieval (else abstain)
     s_max: int = 2000          # Overflow ceiling (S_overflow cap)
 
-    # ── Reasoning Head ──────────────────────────────────────────
-    # ~15 % of total parameter budget
-    d_reasoning: int = 1024    # Context-encoder hidden dim
-    n_reasoning_layers: int = 8
-    d_reasoning_ffn: int = 2816
-    n_reasoning_heads: int = 8
-
     # Consistency gate thresholds (τ_tiered)
-    tau_axiom: float = 0.92    # Physical constants, definitions
-    tau_domain: float = 0.80   # Scientific / technical claims
-    tau_user: float = 0.65     # User preferences, personal context
+    tau_axiom: float = 0.92
+    tau_domain: float = 0.80
+    tau_user: float = 0.65
 
     # Conflict detection
     delta: float = 0.25        # Inversion dead-zone threshold
 
     # ── Decay Engine ────────────────────────────────────────────
-    beta: float = 1.0          # Logarithmic overflow scaling coeff
-    miss_decay_interval: int = 5   # 1-in-5 rule
-    overflow_hit_delta: int = 20   # +20 on hit
-    overflow_miss_delta: int = 20  # -20 on miss
+    beta: float = 1.0
+    miss_decay_interval: int = 5
+    overflow_hit_delta: int = 20
+    overflow_miss_delta: int = 20
 
-    # ── Injection Bridge (W_proj) ───────────────────────────────
-    # ~5 % of total parameter budget
-    # Dimensions: d_model × d_semantic (derived)
-    function_word_suppression: float = 0.2   # α multiplier on function words
+    # ── Function Word Suppression ───────────────────────────────
+    function_word_suppression: float = 0.2
 
-    # Which LLSU layers receive injection (None ⇒ last layer only)
-    injection_layers: Optional[List[int]] = None
-
-    # ── LoRA (Phase 2/3 adapters on System 1) ───────────────────
+    # ── LoRA (Phase 2 adapters on System 1) ─────────────────────
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
 
     # ── Training ────────────────────────────────────────────────
     dropout: float = 0.1
-    weight_tying: bool = True  # Tie input/output embeddings
-
-    # Saliency filter
-    syntactic_filter_cosine: float = 0.3     # Proximity to syntactic centroids
-    semantic_vacuum_min_anchors: int = 2     # Min anchors before skipping S2
+    weight_tying: bool = True
 
     # Paraphrase pass
     paraphrase_cosine_radius: float = 0.15
@@ -105,94 +101,62 @@ class ARNLConfig:
 
     @staticmethod
     def arnold_tiny() -> "ARNLConfig":
-        """Tiny config for unit tests and development (~5M params)."""
+        """Tiny config for unit tests and development (~12M params).
+
+        System 1 commands ~95% of the parameter budget.
+        SHADE is off-budget (database, not neural).
+        """
         return ARNLConfig(
-            vocab_size=1_000,
-            max_seq_len=512,
+            vocab_size=32_000,
+            max_seq_len=2048,
             d_model=256,
             n_layers=4,
             d_ffn=512,
             d_state=64,
             n_heads=4,
             d_semantic=128,
-            k_anchors=3,
-            d_reasoning=128,
-            n_reasoning_layers=2,
-            d_reasoning_ffn=256,
-            n_reasoning_heads=4,
+            shade_top_m=8,
+            shade_top_k=8,
+            shade_context_k=4,
+            h_gap=2.0,
         )
 
     @staticmethod
     def arnold_1b() -> "ARNLConfig":
         """~1 B total parameters."""
         return ARNLConfig(
-            d_model=1536,
-            n_layers=16,
-            d_ffn=4096,
-            d_state=192,
-            n_heads=12,
-            d_reasoning=768,
-            n_reasoning_layers=4,
-            d_reasoning_ffn=2048,
-            n_reasoning_heads=8,
+            d_model=1536, n_layers=16, d_ffn=4096,
+            d_state=192, n_heads=12, d_semantic=768,
         )
 
     @staticmethod
     def arnold_3b() -> "ARNLConfig":
         """~3 B total parameters."""
         return ARNLConfig(
-            d_model=2048,
-            n_layers=24,
-            d_ffn=5504,
-            d_state=256,
-            n_heads=16,
-            d_reasoning=1024,
-            n_reasoning_layers=6,
-            d_reasoning_ffn=2816,
-            n_reasoning_heads=8,
+            d_model=2048, n_layers=24, d_ffn=5504,
+            d_state=256, n_heads=16, d_semantic=768,
         )
 
     @staticmethod
     def arnold_7b() -> "ARNLConfig":
         """~7 B total parameters (reference scale from spec)."""
         return ARNLConfig(
-            d_model=4096,
-            n_layers=32,
-            d_ffn=11008,
-            d_state=512,
-            n_heads=32,
-            d_reasoning=1536,
-            n_reasoning_layers=12,
-            d_reasoning_ffn=4096,
-            n_reasoning_heads=16,
+            d_model=4096, n_layers=32, d_ffn=11008,
+            d_state=512, n_heads=32, d_semantic=768,
         )
 
     @staticmethod
     def arnold_13b() -> "ARNLConfig":
         """~13 B total parameters."""
         return ARNLConfig(
-            d_model=5120,
-            n_layers=40,
-            d_ffn=13824,
-            d_state=640,
-            n_heads=40,
-            d_reasoning=2048,
-            n_reasoning_layers=16,
-            d_reasoning_ffn=5504,
-            n_reasoning_heads=16,
+            d_model=5120, n_layers=40, d_ffn=13824,
+            d_state=640, n_heads=40, d_semantic=768,
         )
 
     @staticmethod
     def arnold_24b() -> "ARNLConfig":
         """~24 B total parameters."""
         return ARNLConfig(
-            d_model=6144,
-            n_layers=48,
-            d_ffn=16384,
-            d_state=768,
-            n_heads=48,
-            d_reasoning=2560,
-            n_reasoning_layers=20,
-            d_reasoning_ffn=6912,
-            n_reasoning_heads=20,
+            d_model=6144, n_layers=48, d_ffn=16384,
+            d_state=768, n_heads=48, d_semantic=768,
         )
