@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arnold Chat</title>
+<link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">A</div>
+      <div>
+        <div class="header-title">Arnold</div>
+        <div class="header-subtitle" id="model-info">Loading model...</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" onclick="clearChat()" title="New chat">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn" onclick="toggleSettings()" title="Settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div class="messages" id="messages">
+    <div class="welcome" id="welcome">
+      <div class="welcome-logo">A</div>
+      <h2>Arnold</h2>
+      <p>HNSVSA-HA Language Model — a hybrid architecture combining local windowed attention with Vector Symbolic Architecture recurrent memory.</p>
+      <div class="suggestions">
+        <div class="suggestion" onclick="sendSuggestion(this)">Explain quantum computing simply</div>
+        <div class="suggestion" onclick="sendSuggestion(this)">Write a Python function to sort a list</div>
+        <div class="suggestion" onclick="sendSuggestion(this)">What is machine learning?</div>
+        <div class="suggestion" onclick="sendSuggestion(this)">Tell me a creative short story</div>
+      </div>
+    </div>
+    <div class="messages-inner" id="messages-inner"></div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-area">
+    <div class="input-container">
+      <textarea id="input" rows="1" placeholder="Message Arnold..." 
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Send">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
+    </div>
+    <div class="footer-text">Arnold 136M — HNSVSA-HA | Responses may be inaccurate</div>
+  </div>
+
+</div>
+
+<!-- Settings overlay -->
+<div class="settings-overlay" id="settings-overlay" onclick="closeSettingsOutside(event)">
+  <div class="settings-panel">
+    <h3>
+      Generation Settings
+      <button class="close-settings" onclick="toggleSettings()">✕</button>
+    </h3>
+    <div class="setting-row">
+      <label>Temperature <span id="temp-val">0.8</span></label>
+      <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.8"
+        oninput="document.getElementById('temp-val').textContent = this.value">
+    </div>
+    <div class="setting-row">
+      <label>Top-K <span id="topk-val">50</span></label>
+      <input type="range" id="top_k" min="1" max="200" step="1" value="50"
+        oninput="document.getElementById('topk-val').textContent = this.value">
+    </div>
+    <div class="setting-row">
+      <label>Top-P (nucleus) <span id="topp-val">0.95</span></label>
+      <input type="range" id="top_p" min="0" max="1" step="0.01" value="0.95"
+        oninput="document.getElementById('topp-val').textContent = this.value">
+    </div>
+    <div class="setting-row">
+      <label>Repetition Penalty <span id="rep-val">1.1</span></label>
+      <input type="range" id="repetition_penalty" min="1" max="2" step="0.05" value="1.1"
+        oninput="document.getElementById('rep-val').textContent = this.value">
+    </div>
+    <div class="setting-row">
+      <label>Max Tokens</label>
+      <input type="number" id="max_tokens" value="512" min="1" max="4096">
+    </div>
+  </div>
+</div>
+
+<script src="/static/chat.js"></script>
+</body>
+</html>

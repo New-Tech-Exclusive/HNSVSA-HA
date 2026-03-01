@@ -1,3 +1,4 @@
+tokenizers/
 checkpoints/
 data/
-tokenizer/
+scripts/
