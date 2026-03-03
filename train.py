@@ -670,7 +670,7 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else {},
         "step": step,
         "config": asdict(config),
         "best_val_loss": best_val,
@@ -1050,6 +1050,26 @@ def parse_args():
     p.add_argument("--synthetic",    action="store_true",
                    help="Use synthetic data (no network required)")
 
+    # Regularization
+    p.add_argument("--entropy_reg", type=float, default=0.0,
+                   help="Entropy regularization coefficient: subtracts α·H(p) from loss "
+                        "to penalize vocabulary collapse (typical: 0.005–0.02)")
+    p.add_argument("--embed_reg", type=float, default=0.0,
+                   help="Embedding weight RMS regularization coefficient "
+                        "to prevent embedding norm collapse/explosion")
+
+    # EMA model weights
+    p.add_argument("--ema_decay", type=float, default=0.0,
+                   help="EMA decay for model weight averaging. 0 = disable. "
+                        "Typical: 0.9999. Smoother eval + better generation quality.")
+    p.add_argument("--ema_update_interval", type=int, default=10,
+                   help="Update EMA weights every N optimizer steps")
+
+    # VSA stability
+    p.add_argument("--spectral_norm_vsa", action="store_true", default=False,
+                   help="Apply spectral normalization to VSA Linear layers "
+                        "to prevent vanishing/exploding gradient paths")
+
     # Optional central config defaults
     try:
         from training_config import DEFAULT_TRAINING_CONFIG
@@ -1073,7 +1093,7 @@ def main():
         args.group_size  = 16
         args.batch_size  = 4
         args.grad_accum  = 1
-        args.max_steps   = 99       # 33 per stage
+        args.max_steps   = 32768 * 3   # 32,768 per stage
         args.warmup_steps = 5
         args.eval_interval = 15
         args.eval_steps  = 3
@@ -1088,11 +1108,11 @@ def main():
             args.enable_curriculum = True
             # Micro-curriculum for smoke test
             args.curriculum = [
-                {"seq_len": 64,  "pct": 0.34, "batch_size": 4, "grad_accum": 1,
+                {"seq_len": 64,  "pct": 0.3333, "batch_size": 4, "grad_accum": 1,
                  "max_lr": 3e-4, "min_lr": 3e-5, "intra_warmup": 5},
-                {"seq_len": 128, "pct": 0.33, "batch_size": 2, "grad_accum": 2,
+                {"seq_len": 128, "pct": 0.3333, "batch_size": 2, "grad_accum": 2,
                  "max_lr": 2e-4, "min_lr": 2e-5, "intra_warmup": 3},
-                {"seq_len": 256, "pct": 0.33, "batch_size": 2, "grad_accum": 2,
+                {"seq_len": 256, "pct": 0.3334, "batch_size": 2, "grad_accum": 2,
                  "max_lr": 1.5e-4, "min_lr": 1.5e-5, "intra_warmup": 3},
             ]
 
@@ -1251,6 +1271,35 @@ def main():
     # fp16 path kept for completeness; on this GPU bf16 is always used.
     use_scaler = (dtype == torch.float16)
     scaler = torch.amp.GradScaler("cuda") if use_scaler else None
+
+    # ── Raw model reference (pre-compile) ────────────────────────────
+    # Must be kept before torch.compile so we can access nn.Module
+    # interfaces for EMA updates and spectral norm application.
+    raw_model = model
+
+    # Spectral normalization on VSA Linear layers — prevents vanishing /
+    # exploding gradient paths through the novel VSA mechanism.
+    if getattr(args, "spectral_norm_vsa", False):
+        from torch.nn.utils.parametrizations import spectral_norm as _spectral_norm
+        _sn_count = 0
+        for _sn_name, _sn_mod in raw_model.named_modules():
+            if "soft_vsa" in _sn_name and isinstance(_sn_mod, nn.Linear):
+                _spectral_norm(_sn_mod, n_power_iterations=1)
+                _sn_count += 1
+        if _sn_count:
+            print(f"Spectral norm: applied to {_sn_count} VSA Linear layers")
+
+    # EMA model — exponential moving average of weights for smoother
+    # evaluation and generation quality (used in most modern LMs).
+    ema_model: "HybridNSVSA | None" = None
+    ema_decay = getattr(args, "ema_decay", 0.0)
+    ema_update_interval = getattr(args, "ema_update_interval", 10)
+    if ema_decay > 0:
+        from copy import deepcopy as _deepcopy
+        ema_model = _deepcopy(raw_model).to(device).eval()
+        for _p in ema_model.parameters():
+            _p.requires_grad_(False)
+        print(f"EMA model: decay={ema_decay}, update every {ema_update_interval} steps")
 
     # ── Curriculum stages ────────────────────────────────────────────
     if use_curriculum:
@@ -1548,11 +1597,36 @@ def main():
                 out = model(input_ids, labels=input_ids)
                 loss = out["loss"] / current_stage.grad_accum
 
+                # ── Entropy regularization (penalty for vocabulary collapse) ──
+                # Subtracts α·H(p) from loss so the model is rewarded for
+                # spreading probability mass across the vocabulary.
+                if args.entropy_reg > 0.0:
+                    _logits_reg = out.get("logits")
+                    if _logits_reg is not None:
+                        _log_p = torch.log_softmax(_logits_reg.float(), dim=-1)
+                        _H_tok = -(_log_p.exp() * _log_p).sum(dim=-1).mean()
+                        loss = loss - args.entropy_reg * _H_tok / current_stage.grad_accum
+
+                # ── Embedding weight norm regularization ──────────────────────
+                # Penalises RMS norm growth in the embedding matrix to prevent
+                # the weight-tied projection from drifting too large.
+                if args.embed_reg > 0.0:
+                    _emb_rms = (raw_model.embedding.weight.float() ** 2).mean().sqrt()
+                    loss = loss + args.embed_reg * _emb_rms / current_stage.grad_accum
+
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
             _lv = loss.item()
+            # Min-loss floor detection — suspiciously small values suggest
+            # a degenerate batch (all pad tokens, all identical, etc.)
+            if _lv * current_stage.grad_accum < 0.01:
+                tqdm.write(
+                    f"  ⚠  Suspiciously low loss "
+                    f"{_lv * current_stage.grad_accum:.6f} at step {step+1} "
+                    f"(micro {micro+1}) — possible batch degeneration"
+                )
             accum_loss += _lv
             _micro_loss_sum += _lv
             tokens_seen += input_ids.numel()
@@ -1609,6 +1683,15 @@ def main():
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        # EMA weight update — blend live weights into the EMA shadow copy.
+        # Uses raw_model to bypass the torch.compile wrapper.
+        if ema_model is not None and (step + 1) % ema_update_interval == 0:
+            with torch.no_grad():
+                for _p_ema, _p_live in zip(
+                    ema_model.parameters(), raw_model.parameters()
+                ):
+                    _p_ema.data.mul_(ema_decay).add_(_p_live.data, alpha=1.0 - ema_decay)
+
         # ── Logging ──────────────────────────────────────────────────
         if (step + 1) % args.log_interval == 0:
             dt = time.perf_counter() - t0
@@ -1638,9 +1721,19 @@ def main():
             gate_str = ""
             if args.log_gate_values:
                 gate_str = "\n" + log_gate_values(model)
+
+            # EMA model validation — separate fresh iterator to avoid bias
+            ema_val_str = ""
+            ema_val_loss = None
+            if ema_model is not None:
+                val_iter_ema = make_val_iter(current_stage.seq_len, current_stage.batch_size)
+                ema_val_loss = evaluate(ema_model, val_iter_ema, args.eval_steps, device, ctx)
+                ema_val_str = f"  ema val: {ema_val_loss:.4f}"
+
             tqdm.write(
                 f"  ── val loss: {val_loss:.4f}  (best: {best_val:.4f})  "
                 f"[stage {current_stage.index}, seq={current_stage.seq_len}]"
+                f"{ema_val_str}"
                 f"{gate_str}"
             )
             if best_val < float("inf") and val_loss > best_val * 1.15:
@@ -1650,15 +1743,26 @@ def main():
                     f"  ⚠  Val spike: {val_loss:.4f} > best {best_val:.4f} × 1.15"
                     f" — LR ×0.5 for 200 steps"
                 )
-            if val_loss < best_val:
-                best_val = val_loss
+            # Use the better of live-model and EMA-model loss for best checkpoint
+            tracked_val = min(val_loss, ema_val_loss) if ema_val_loss is not None else val_loss
+            if tracked_val < best_val:
+                best_val = tracked_val
                 save_checkpoint(
                     ckpt_dir / "best.pt",
                     model, optimizer, step + 1, config, best_val, tok_info,
                     stage_idx=current_stage.index,
                     curriculum_config=curriculum_raw,
                 )
-                update_ledger(ckpt_dir, "best.pt", step + 1, val_loss, current_stage.index)
+                update_ledger(ckpt_dir, "best.pt", step + 1, tracked_val, current_stage.index)
+                # Also save EMA weights separately when EMA is better than live model
+                if ema_val_loss is not None and ema_val_loss < val_loss:
+                    save_checkpoint(
+                        ckpt_dir / "best_ema.pt",
+                        ema_model, None, step + 1, config, ema_val_loss, tok_info,
+                        stage_idx=current_stage.index,
+                        curriculum_config=curriculum_raw,
+                    )
+                    update_ledger(ckpt_dir, "best_ema.pt", step + 1, ema_val_loss, current_stage.index)
 
         # ── Periodic save ────────────────────────────────────────────
         if (step + 1) % args.save_interval == 0:

@@ -245,9 +245,10 @@ class SoftVSAStateUpdate(nn.Module):
             group_vec = F.normalize(
                 new_accum / self.K, p=2, dim=-1, eps=self.eps
             )
-            # Bind group vector to its macro position
+            # Bind group vector to its macro position (clamp index to avoid OOB)
+            safe_n = min(new_n_groups, macro_positions.shape[0] - 1)
             bound_group = self.bind(
-                group_vec, macro_positions[new_n_groups]
+                group_vec, macro_positions[safe_n]
             )
             # EMA update of global state
             α = self.decay                                  # [d]
@@ -314,7 +315,14 @@ class SoftVSAStateUpdate(nn.Module):
                 )
             return empty_q, empty_s, new_cache
 
-        macro_pos = macro_positions[:n_groups]
+        # Clamp-gather: if mode-token prepend creates one extra group beyond
+        # the codebook size, reuse the last position rather than going OOB.
+        n_avail = macro_positions.shape[0]
+        if n_groups <= n_avail:
+            macro_pos = macro_positions[:n_groups]
+        else:
+            safe_idx = torch.arange(n_groups, device=macro_positions.device).clamp(max=n_avail - 1)
+            macro_pos = macro_positions[safe_idx]
         global_states = self.compute_causal_global_states(group_vecs, macro_pos)
         # global_states: [B, n_groups, d]
 

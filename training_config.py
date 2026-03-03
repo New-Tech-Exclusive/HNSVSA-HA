@@ -37,7 +37,7 @@ DEFAULT_TRAINING_CONFIG = {
 
     "batch_size": 2,  # Micro-batch size per optimizer micro-step (used in flat / stage-1 mode).
     "grad_accum": 16,  # Number of micro-steps before optimizer.step().
-    "max_steps": 200_000,  # 40k per phase × 5 phases.
+    "max_steps": 163840,  # 32,768 per phase × 5 phases.
     "max_lr": 3e-4,  # Peak learning rate after warmup.
     "min_lr": 3e-5,  # Final cosine-decay learning rate floor.
     "warmup_steps": 3000,  # Linear warmup duration before cosine decay (stage 1 or flat).
@@ -45,9 +45,9 @@ DEFAULT_TRAINING_CONFIG = {
     "vsa_lr_scale": 0.3,  # Multiplier for VSA parameter-group LR vs base LR.
     "vsa_grad_scale": 30.0,  # Gradient multiplier for VSA params (counteracts EMA attenuation).
     "gate_init_bias": -2.0,  # Initial vsa_gate bias; sigmoid(-2)≈0.12, VSA starts quiet.
-    "grad_clip": 1.0,  # Global gradient norm clip threshold.
+    "grad_clip": 0.5,  # Global gradient norm clip threshold.
     "beta1": 0.9,  # AdamW beta1 (momentum of first moment estimate).
-    "beta2": 0.95,  # AdamW beta2 (second-moment smoothing; 0.95 adapts faster than 0.999).
+    "beta2": 0.90,  # AdamW beta2 (second-moment smoothing; 0.90 adapts faster than 0.999).
 
     # Thinking-mode control
     # Mode tokens (<|fast|>/<|reason|>/<|deep|>) control thinking depth:
@@ -68,43 +68,43 @@ DEFAULT_TRAINING_CONFIG = {
     # Curriculum training
     "enable_curriculum": True,  # Enable multi-stage curriculum. False = flat single-stage.
     "curriculum": [
-        # Stage 0 (40K steps): short context, fast iteration.
+        # Stage 0 (32,768 steps): short context, fast iteration.
         {
             "seq_len": 512,
-            "pct": 0.20,  # 40,000 / 200,000
+            "pct": 0.20,  # 32,768 / 163,840
             "batch_size": 4,   # larger micro-batch → better GPU util
             "grad_accum": 8,   # eff batch = 32
             "max_lr": 3e-4,
             "min_lr": 3e-5,
             "intra_warmup": 3000,  # Stage 0 gets the global warmup.
         },
-        # Stage 1 (40K steps): medium context, VSA activation.
+        # Stage 1 (32,768 steps): medium context, VSA activation.
         {
             "seq_len": 1024,
-            "pct": 0.20,  # 40,000 / 200,000
+            "pct": 0.20,  # 32,768 / 163,840
             "batch_size": 2,
             "grad_accum": 16,
             "max_lr": 2e-4,
             "min_lr": 2e-5,
             "intra_warmup": 500,
         },
-        # Stage 2 (40K steps): long context, full hierarchical VSA pressure.
+        # Stage 2 (32,768 steps): long context, full hierarchical VSA pressure.
         {
             "seq_len": 2048,
-            "pct": 0.20,  # 40,000 / 200,000
+            "pct": 0.20,  # 32,768 / 163,840
             "batch_size": 1,
             "grad_accum": 32,
             "max_lr": 1.5e-4,
             "min_lr": 1.5e-5,
             "intra_warmup": 500,
         },
-        # Stage 3 (40K steps): think-token supervision.
+        # Stage 3 (32,768 steps): think-token supervision.
         # Teaches the model when and
         # how to use <|think|> ... <|/think|> spans.  Pure CoT data, low LR.
         # sample_mode_tokens() is skipped for this stage; mode tokens are baked in.
         {
             "seq_len": 512,
-            "pct": 0.20,   # 40,000 / 200,000
+            "pct": 0.20,   # 32,768 / 163,840
             "batch_size": 4,
             "grad_accum": 8,
             "max_lr": 5e-5,   # fine-tuning LR — gentle, don't overwrite pretraining
@@ -112,10 +112,10 @@ DEFAULT_TRAINING_CONFIG = {
             "intra_warmup": 200,
             "cot_mix": 1.0,   # 100 % CoT data — every batch is think-supervised
         },
-        # Stage 4 (40K steps): alignment phase (instruction tuning + RLHF-style preference SFT).
+        # Stage 4 (32,768 steps): alignment phase (instruction tuning + RLHF-style preference SFT).
         {
             "seq_len": 512,
-            "pct": 0.20,  # 40,000 / 200,000
+            "pct": 0.20,  # 32,768 / 163,840
             "batch_size": 4,
             "grad_accum": 8,
             "max_lr": 3e-5,
@@ -138,6 +138,20 @@ DEFAULT_TRAINING_CONFIG = {
 
     "compile": True,  # Request torch.compile (auto-skipped on Python 3.14+).
     "no_compile": False,  # Force-disable compile when set True.
+
+    # Regularization (opt-in — set > 0.0 to enable)
+    "entropy_reg": 0.0,    # Entropy bonus: prevents vocabulary collapse (subtracts α·H(p) from loss).
+                           # WARNING: log_softmax over full vocab on every micro-step is expensive.
+                           # Typical useful range: 0.005–0.02. Default off.
+    "embed_reg": 0.005,      # Embedding RMS norm regularization. Typical: 1e-4. Default off.
+
+    # EMA model weights (opt-in — set > 0.0 to enable)
+    "ema_decay": 0.9999,          # EMA decay rate; 0 = disable. 0.9999 ≈ 10k-step half-life.
+                               # Adds ~103M params on GPU + update overhead every 10 steps.
+    "ema_update_interval": 10, # Update shadow weights every N optimizer steps.
+
+    # VSA stability (opt-in — interacts with torch.compile)
+    "spectral_norm_vsa": False,  # Apply spectral norm to VSA Linear layers.
 
     "reason_warmup_steps": 0,  # (deprecated, kept for compat) No longer used.
 
