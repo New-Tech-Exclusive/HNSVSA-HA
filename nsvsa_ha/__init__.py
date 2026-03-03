@@ -14,7 +14,9 @@ from .local_attention import LocalWindowedAttention, repeat_kv
 from .ffn import SwiGLUFFN, build_ffn
 from .hybrid_layer import HybridNSVSALayer, HybridNSVSALayerStack
 from .tokenizer import BaseTokenizer, load_tokenizer, tokenizer_compatible
-from .reasoning import ReasoningBlock, ReasoningController, ponder_loss_fn
+from .modes import (
+    MODE_FAST, MODE_REASON, MODE_DEEP, NUM_MODES, DEFAULT_THINK_FRACS,
+)
 from .rmsnorm import RMSNorm
 
 __version__ = "0.4.0"
@@ -33,8 +35,10 @@ __all__ = [
     "BaseTokenizer",
     "load_tokenizer",
     "tokenizer_compatible",
-    "ReasoningBlock",
-    "ReasoningController",
-    "ponder_loss_fn",
+    "MODE_FAST",
+    "MODE_REASON",
+    "MODE_DEEP",
+    "NUM_MODES",
+    "DEFAULT_THINK_FRACS",
     "RMSNorm",
 ]

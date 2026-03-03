@@ -73,6 +73,26 @@ function addMessage(role, html) {
   return msgDiv;
 }
 
+function createReasoningPanel(parentEl) {
+  const panel = document.createElement('details');
+  panel.className = 'reasoning-panel';
+  panel.open = false;
+
+  const summary = document.createElement('summary');
+  summary.className = 'reasoning-summary';
+  summary.textContent = 'Show reasoning';
+
+  const body = document.createElement('div');
+  body.className = 'reasoning-body';
+  body.textContent = 'Reasoning will appear here if provided by the model.';
+
+  panel.appendChild(summary);
+  panel.appendChild(body);
+  parentEl.appendChild(panel);
+
+  return { panel, summary, body };
+}
+
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -157,6 +177,23 @@ async function sendMessage() {
   const assistantMsg = addMessage('assistant',
     '<div class="typing-indicator"><span></span><span></span><span></span></div>');
   const bubbleEl = assistantMsg.querySelector('.bubble');
+  const {
+    panel: reasoningPanelEl,
+    summary: reasoningSummaryEl,
+    body: reasoningBodyEl,
+  } = createReasoningPanel(bubbleEl);
+  reasoningSummaryEl.addEventListener('click', () => {
+    setTimeout(() => {
+      reasoningSummaryEl.textContent = reasoningPanelEl.open ? 'Hide reasoning' : 'Show reasoning';
+    }, 0);
+  });
+
+  const assistantTextEl = document.createElement('div');
+  assistantTextEl.className = 'assistant-text';
+
+  const statsEl = document.createElement('div');
+  statsEl.className = 'stats';
+  statsEl.style.display = 'none';
 
   // Update button to stop
   isGenerating = true;
@@ -165,6 +202,8 @@ async function sendMessage() {
   sendBtn.onclick = stopGeneration;
 
   let fullText = '';
+  let reasoningText = '';
+  let sawReasoning = false;
   abortController = new AbortController();
 
   try {
@@ -198,35 +237,90 @@ async function sendMessage() {
         if (data.token) {
           if (firstToken) {
             bubbleEl.innerHTML = '';
+            bubbleEl.appendChild(reasoningPanelEl);
+            bubbleEl.appendChild(assistantTextEl);
+            bubbleEl.appendChild(statsEl);
             firstToken = false;
           }
           fullText += data.token;
-          bubbleEl.innerHTML = renderText(fullText);
+          assistantTextEl.innerHTML = renderText(fullText);
           scrollToBottom();
+        }
+
+        if (data.reasoning || data.thinking) {
+          sawReasoning = true;
+          const chunk = data.reasoning || data.thinking;
+          reasoningText += chunk;
+          reasoningBodyEl.innerHTML = renderText(reasoningText);
+          reasoningSummaryEl.textContent = 'Hide reasoning';
         }
 
         if (data.done) {
           // Append stats
-          const statsHtml = `<div class="stats">${data.tokens} tokens · ${data.tok_per_s} tok/s · ${data.time_s}s</div>`;
-          bubbleEl.innerHTML = renderText(fullText) + statsHtml;
+          if (firstToken) {
+            bubbleEl.innerHTML = '';
+            bubbleEl.appendChild(reasoningPanelEl);
+            bubbleEl.appendChild(assistantTextEl);
+            bubbleEl.appendChild(statsEl);
+            assistantTextEl.innerHTML = renderText(fullText);
+            firstToken = false;
+          }
+          statsEl.style.display = '';
+          statsEl.textContent = `${data.tokens} tokens · ${data.tok_per_s} tok/s · ${data.time_s}s`;
+          if (!sawReasoning) {
+            reasoningBodyEl.textContent = 'No reasoning trace was provided by the backend for this response.';
+          }
           scrollToBottom();
         }
 
         if (data.error) {
-          bubbleEl.innerHTML = `<span style="color:#e55565">${escapeHtml(data.error)}</span>`;
+          if (firstToken) {
+            bubbleEl.innerHTML = '';
+            bubbleEl.appendChild(reasoningPanelEl);
+            bubbleEl.appendChild(assistantTextEl);
+            bubbleEl.appendChild(statsEl);
+            firstToken = false;
+          }
+          assistantTextEl.innerHTML = `<span style="color:#e55565">${escapeHtml(data.error)}</span>`;
+          if (!sawReasoning) {
+            reasoningBodyEl.textContent = 'No reasoning trace was provided due to a generation error.';
+          }
         }
       }
     }
   } catch (err) {
     if (err.name === 'AbortError') {
       if (fullText) {
-        bubbleEl.innerHTML = renderText(fullText) +
-          '<div class="stats" style="color:#e55565">Generation stopped</div>';
+        bubbleEl.innerHTML = '';
+        bubbleEl.appendChild(reasoningPanelEl);
+        bubbleEl.appendChild(assistantTextEl);
+        bubbleEl.appendChild(statsEl);
+        assistantTextEl.innerHTML = renderText(fullText);
+        statsEl.style.display = '';
+        statsEl.style.color = '#e55565';
+        statsEl.textContent = 'Generation stopped';
+        if (!sawReasoning) {
+          reasoningBodyEl.textContent = 'No reasoning trace was provided before generation stopped.';
+        }
       } else {
-        bubbleEl.innerHTML = '<span style="color:var(--text-muted)">Stopped</span>';
+        bubbleEl.innerHTML = '';
+        bubbleEl.appendChild(reasoningPanelEl);
+        bubbleEl.appendChild(assistantTextEl);
+        bubbleEl.appendChild(statsEl);
+        assistantTextEl.innerHTML = '<span style="color:var(--text-muted)">Stopped</span>';
+        if (!sawReasoning) {
+          reasoningBodyEl.textContent = 'No reasoning trace was provided before generation stopped.';
+        }
       }
     } else {
-      bubbleEl.innerHTML = `<span style="color:#e55565">Error: ${escapeHtml(err.message)}</span>`;
+      bubbleEl.innerHTML = '';
+      bubbleEl.appendChild(reasoningPanelEl);
+      bubbleEl.appendChild(assistantTextEl);
+      bubbleEl.appendChild(statsEl);
+      assistantTextEl.innerHTML = `<span style="color:#e55565">Error: ${escapeHtml(err.message)}</span>`;
+      if (!sawReasoning) {
+        reasoningBodyEl.textContent = 'No reasoning trace was provided due to an error during generation.';
+      }
     }
   } finally {
     isGenerating = false;

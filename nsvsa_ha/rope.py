@@ -137,6 +137,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cache", cos_cache, persistent=False)
         self.register_buffer("sin_cache", sin_cache, persistent=False)
 
+    @torch._dynamo.disable
     def _maybe_extend_cache(self, seq_len: int):
         if seq_len <= self.cos_cache.shape[0]:
             return
@@ -149,6 +150,7 @@ class RotaryEmbedding(nn.Module):
         self.cos_cache = cos_cache
         self.sin_cache = sin_cache
 
+    @torch._dynamo.disable
     def forward(
         self,
         q: torch.Tensor,          # [B, heads, seq_len, head_dim]

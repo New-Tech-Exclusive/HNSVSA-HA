@@ -269,6 +269,54 @@ html, body {
   padding: 8px 0;
 }
 
+.assistant-text {
+  margin-top: 8px;
+}
+
+.reasoning-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.reasoning-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.reasoning-summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning-summary::after {
+  content: '▾';
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+
+.reasoning-panel[open] .reasoning-summary::after {
+  transform: rotate(180deg);
+}
+
+.reasoning-body {
+  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
 /* Typing indicator */
 .typing-indicator {
   display: inline-flex;

@@ -35,14 +35,17 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 from nsvsa_ha import HybridNSVSA, HybridNSVSAConfig
 from nsvsa_ha.tokenizer import BaseTokenizer, load_tokenizer, tokenizer_compatible
+from nsvsa_ha.modes import MODE_FAST, MODE_REASON, MODE_DEEP
+
+_MODE_NAME_MAP = {"fast": MODE_FAST, "reason": MODE_REASON, "deep": MODE_DEEP}
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-DEFAULT_TOKENIZER_JSON = "tokenizers/vsa48k_en_code/tokenizer.json"
-DEFAULT_TOKENIZER_META = "tokenizers/vsa48k_en_code/tokenizer_meta.json"
+DEFAULT_TOKENIZER_JSON = "tokenizers/vsa65k_mix/tokenizer.json"
+DEFAULT_TOKENIZER_META = "tokenizers/vsa65k_mix/tokenizer_meta.json"
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -80,6 +83,10 @@ class ChatRequest(BaseModel):
     top_p: float | None = Field(default=0.95, ge=0.0, le=1.0)
     max_tokens: int = Field(default=512, ge=1, le=4096)
     repetition_penalty: float = Field(default=1.1, ge=1.0, le=3.0)
+    mode: str = Field(
+        default="deep",
+        description="Reasoning mode: 'fast', 'reason', or 'deep'",
+    )
 
 
 class ModelInfo(BaseModel):
@@ -143,56 +150,123 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
     Run autoregressive generation in a thread (torch is sync),
     yielding SSE events for each token.
     """
-    token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    token_queue: asyncio.Queue[dict | None] = asyncio.Queue()
     stats: dict = {}
 
     def _generate():
         """Synchronous generation — runs in a thread."""
         nonlocal stats
+
+        def emit(event: dict):
+            token_queue.put_nowait(event)
+
+        def _to_float(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    return None
+                return float(value.detach().float().mean().item())
+            return float(value)
+
+        def _sample_logits(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
+            """Apply repetition penalty, temperature, top-k/p then sample 1 token."""
+            lgt = logits.clone()
+            if req.repetition_penalty != 1.0:
+                seen = context_ids[0].unique()
+                lgt[:, seen] /= req.repetition_penalty
+            lgt = lgt / max(req.temperature, 1e-8)
+            if req.top_k is not None:
+                k = min(req.top_k, lgt.size(-1))
+                kth = torch.topk(lgt, k).values[:, -1, None]
+                lgt = lgt.masked_fill(lgt < kth, float("-inf"))
+            if req.top_p is not None:
+                sl, si = torch.sort(lgt, descending=True)
+                cum = torch.cumsum(torch.softmax(sl, dim=-1), dim=-1)
+                rm = cum > req.top_p
+                rm[:, 1:] = rm[:, :-1].clone()
+                rm[:, 0] = False
+                sl[rm] = float("-inf")
+                lgt = sl.scatter(1, si, sl)
+            return torch.multinomial(torch.softmax(lgt, dim=-1), 1)
+
         with torch.no_grad():
             input_ids = tokenizer.encode(req.message)
+
+            # Prepend mode control token if available
+            mode_name = getattr(req, "mode", "deep") or "deep"
+            mode_id = _MODE_NAME_MAP.get(mode_name, MODE_DEEP)
+            mode_tok_ids = model.config.mode_token_ids
+            if mode_tok_ids and mode_id in mode_tok_ids:
+                input_ids = [mode_tok_ids[mode_id]] + input_ids
+
             ids = torch.tensor([input_ids], dtype=torch.long, device=device)
             eot = tokenizer.eot_token
 
+            # Think-token IDs from tokenizer (None if not in vocab)
+            think_id     = getattr(tokenizer, "think_token_id", None)
+            end_think_id = getattr(tokenizer, "end_think_token_id", None)
+
+            # Thinking budget: deep=256 tokens, reason=128, fast=0
+            if think_id is not None and mode_id != MODE_FAST:
+                max_think = 256 if mode_id == MODE_DEEP else 128
+            else:
+                max_think = 0
+
             generated_tokens: list[int] = []
             t0 = time.perf_counter()
+            decode_reason_step_sum = 0.0
+            decode_reason_step_count = 0
 
-            # Prefill
+            # ── Prefill ──────────────────────────────────────────────
             out = model(ids, use_cache=True)
             logits = out["logits"][:, -1, :]
             cache = out["cache"]
 
+            # ── Thinking panel header ─────────────────────────────────
+            mode_label = mode_name.upper()
+            emit({"thinking": f"[{mode_label} mode · think budget: {max_think} tokens]\n\n"})
+
+            # ── Thinking phase (reason / deep modes only) ────────────
+            if max_think > 0 and think_id is not None:
+                # Inject <|think|> into context and take one decode step
+                think_tok = torch.tensor([[think_id]], dtype=torch.long, device=device)
+                ids = torch.cat([ids, think_tok], dim=1)
+                out = model(think_tok, cache=cache, use_cache=True)
+                logits = out["logits"][:, -1, :]
+                cache  = out["cache"]
+
+                think_count = 0
+                while think_count < max_think:
+                    tok = _sample_logits(logits, ids)
+                    tok_id = int(tok.item())
+                    ids = torch.cat([ids, tok], dim=1)
+                    if tok_id == eot:
+                        break
+                    text = tokenizer.decode([tok_id])
+                    emit({"thinking": text})
+                    out    = model(tok, cache=cache, use_cache=True)
+                    logits = out["logits"][:, -1, :]
+                    cache  = out["cache"]
+                    if tok_id == end_think_id:
+                        # Model closed its think block voluntarily
+                        break
+                    think_count += 1
+                else:
+                    # Budget exhausted — force-close the think block
+                    end_tok = torch.tensor([[end_think_id]], dtype=torch.long, device=device)
+                    ids = torch.cat([ids, end_tok], dim=1)
+                    emit({"thinking": tokenizer.decode([end_think_id])})
+                    out    = model(end_tok, cache=cache, use_cache=True)
+                    logits = out["logits"][:, -1, :]
+                    cache  = out["cache"]
+
+                emit({"thinking": "\n\n"})  # visual separator before the answer
+
+            # ── Answer generation ────────────────────────────────────
             for _ in range(req.max_tokens):
-                # Repetition penalty
-                if req.repetition_penalty != 1.0:
-                    seen = ids[0].unique()
-                    logits[:, seen] /= req.repetition_penalty
-
-                # Temperature
-                logits = logits / max(req.temperature, 1e-8)
-
-                # Top-k
-                if req.top_k is not None:
-                    k = min(req.top_k, logits.size(-1))
-                    kth = torch.topk(logits, k).values[:, -1, None]
-                    logits = logits.masked_fill(logits < kth, float("-inf"))
-
-                # Top-p (nucleus)
-                if req.top_p is not None:
-                    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                    cum_probs = torch.cumsum(
-                        torch.softmax(sorted_logits, dim=-1), dim=-1
-                    )
-                    remove = cum_probs > req.top_p
-                    remove[:, 1:] = remove[:, :-1].clone()
-                    remove[:, 0] = False
-                    sorted_logits[remove] = float("-inf")
-                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-
-                # Sample
-                probs = torch.softmax(logits, dim=-1)
-                tok = torch.multinomial(probs, 1)
-                tok_id = tok.item()
+                tok = _sample_logits(logits, ids)
+                tok_id = int(tok.item())
 
                 if tok_id == eot:
                     break
@@ -200,20 +274,18 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                 ids = torch.cat([ids, tok], dim=1)
                 generated_tokens.append(tok_id)
 
-                # Decode token text and push to queue
                 text = tokenizer.decode([tok_id])
-                token_queue.put_nowait(text)
+                emit({"token": text})
 
-                # Cached decode step
-                out = model(tok, cache=cache, use_cache=True)
+                out    = model(tok, cache=cache, use_cache=True)
                 logits = out["logits"][:, -1, :]
-                cache = out["cache"]
+                cache  = out["cache"]
 
-            dt = time.perf_counter() - t0
+            dt    = time.perf_counter() - t0
             tok_s = len(generated_tokens) / max(dt, 1e-6)
             stats.update({
-                "tokens": len(generated_tokens),
-                "time_s": round(dt, 2),
+                "tokens":    len(generated_tokens),
+                "time_s":    round(dt, 2),
                 "tok_per_s": round(tok_s, 1),
             })
             token_queue.put_nowait(None)  # Signal done
@@ -224,17 +296,17 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
 
         while True:
             try:
-                text = await asyncio.wait_for(token_queue.get(), timeout=60.0)
+                event = await asyncio.wait_for(token_queue.get(), timeout=60.0)
             except asyncio.TimeoutError:
                 yield f"data: {json.dumps({'error': 'Generation timed out'})}\n\n"
                 break
 
-            if text is None:
+            if event is None:
                 # Send completion stats
                 yield f"data: {json.dumps({'done': True, **stats})}\n\n"
                 break
 
-            yield f"data: {json.dumps({'token': text})}\n\n"
+            yield f"data: {json.dumps(event)}\n\n"
 
         await gen_task
 
@@ -251,7 +323,30 @@ def load_model_from_args(args, tok_info: dict) -> tuple[HybridNSVSA, torch.devic
         cfg_dict = ckpt["config"]
         config = HybridNSVSAConfig(**cfg_dict)
         mdl = HybridNSVSA(config)
-        mdl.load_state_dict(ckpt["model"])
+        # Checkpoints saved from torch.compile'd models have keys prefixed
+        # with "_orig_mod." — strip it so they load into a plain model.
+        state = ckpt["model"]
+        if any(k.startswith("_orig_mod.") for k in state):
+            state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        # Expand vocabulary if tokenizer has grown since checkpoint was saved
+        ckpt_vocab = state["embedding.weight"].shape[0]
+        tok_vocab = tok_info.get("vocab_size", config.vocab_size)
+        if ckpt_vocab < tok_vocab:
+            def _pad_w(w: torch.Tensor, new_rows: int) -> torch.Tensor:
+                padded = torch.zeros(new_rows, w.shape[1], dtype=w.dtype)
+                padded[:w.shape[0]] = w
+                return padded
+            state = dict(state)
+            state["embedding.weight"] = _pad_w(state["embedding.weight"], tok_vocab)
+            if "lm_head.weight" in state:
+                state["lm_head.weight"] = _pad_w(state["lm_head.weight"], tok_vocab)
+            config.vocab_size = tok_vocab
+            mdl = HybridNSVSA(config)  # rebuild with correct vocab
+            print(f"  vocab expanded: {ckpt_vocab} → {tok_vocab}")
+        mdl.load_state_dict(state)
+        # Re-tie lm_head → embedding after load_state_dict (which breaks the tie)
+        if config.tie_weights:
+            mdl.lm_head.weight = mdl.embedding.weight
         ckpt_tok = ckpt.get("tokenizer")
         if ckpt_tok and not tokenizer_compatible(ckpt_tok, tok_info):
             print(

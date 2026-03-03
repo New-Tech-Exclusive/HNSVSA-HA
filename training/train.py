@@ -725,11 +725,6 @@ def main():
         num_kv_heads=getattr(args, "num_kv_heads", 0),
         qk_norm=getattr(args, "qk_norm", True),
         learned_vsa_positions=getattr(args, "learned_vsa_positions", True),
-        reasoning_layers=getattr(args, "reasoning_layers", 0),
-        max_reason_steps=getattr(args, "max_reason_steps", 8),
-        reason_hidden_dim=getattr(args, "reason_hidden_dim", 256),
-        ponder_lambda=getattr(args, "ponder_lambda", 0.01),
-        ponder_p_geo=getattr(args, "ponder_p_geo", 0.5),
     )
 
     model = HybridNSVSA(config).to(device)
@@ -741,9 +736,6 @@ def main():
           f"QK-Norm={'on' if config.qk_norm else 'off'}, "
           f"LearnedVSAPos={'on' if config.learned_vsa_positions else 'off'}, "
           f"RMSNorm=on")
-    if config.reasoning_enabled:
-        print(f"Reasoning: {config.reasoning_layers} layers, max {config.max_reason_steps} steps, "
-              f"λ_ponder={config.ponder_lambda}")
 
     # ── VSA gradient scaling hook ────────────────────────────────────
     vsa_grad_scale = getattr(args, "vsa_grad_scale", 1.0)
@@ -893,8 +885,6 @@ def main():
     optimizer.zero_grad(set_to_none=True)
 
     accum_loss = 0.0
-    accum_ponder = 0.0
-    accum_reason_steps = 0.0
     t0 = time.perf_counter()
     tokens_seen = 0
     ckpt_dir = Path(args.checkpoint_dir)
@@ -923,8 +913,6 @@ def main():
             t0 = time.perf_counter()
             tokens_seen = 0
             accum_loss = 0.0
-            accum_ponder = 0.0
-            accum_reason_steps = 0.0
 
             eff_batch = current_stage.batch_size * current_stage.grad_accum
             tqdm.write(
@@ -965,10 +953,6 @@ def main():
             scaler.scale(loss).backward()
             accum_loss += loss.item()
             tokens_seen += input_ids.numel()
-            # Track reasoning metrics
-            if "ponder_cost" in out:
-                accum_ponder += out["ponder_cost"].item() / current_stage.grad_accum
-                accum_reason_steps += out["mean_reason_steps"].item() / current_stage.grad_accum
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -1003,11 +987,6 @@ def main():
             dt = time.perf_counter() - t0
             tok_per_sec = tokens_seen / dt
             avg_loss = accum_loss / args.log_interval
-            ponder_str = ""
-            if accum_ponder > 0:
-                avg_ponder = accum_ponder / args.log_interval
-                avg_rsteps = accum_reason_steps / args.log_interval
-                ponder_str = f" | ponder {avg_ponder:.4f}  steps {avg_rsteps:.1f}"
             step_iter.set_postfix(
                 loss=f"{avg_loss:.4f}",
                 lr=f"{lr:.2e}",
@@ -1022,11 +1001,8 @@ def main():
                 f"grad_norm {grad_norm_value:.2f} | "
                 f"{tok_per_sec:,.0f} tok/s"
                 f"{branch_norms_str}"
-                f"{ponder_str}"
             )
             accum_loss = 0.0
-            accum_ponder = 0.0
-            accum_reason_steps = 0.0
 
         # ── Eval ─────────────────────────────────────────────────────
         if (step + 1) % args.eval_interval == 0:

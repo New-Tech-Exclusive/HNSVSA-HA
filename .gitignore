@@ -2,3 +2,7 @@ tokenizers/
 checkpoints/
 data/
 scripts/
+uv.lock
+.python-version
+__pycache__/
+.gitignore 

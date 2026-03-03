@@ -32,6 +32,42 @@ from pathlib import Path
 from typing import Iterator
 
 from datasets import load_dataset
+
+# ── Corpus mix (mirrors CORPUS_CONFIG in pretokenize_dataset.py) ──────────────
+CORPUS_CONFIG = [
+    {
+        "name": "HuggingFaceFW/fineweb-edu",
+        "text_field": "text",
+        "split": "train",
+        "pct": 0.45,
+    },
+    {
+        "name": "bigcode/starcoderdata",
+        "text_field": "content",
+        "split": "train",
+        "pct": 0.20,
+    },
+    {
+        "name": "wikimedia/wikipedia",
+        "config": "20231101.en",
+        "text_field": "text",
+        "split": "train",
+        "pct": 0.15,
+    },
+    {
+        "name": "emozilla/pg19-test",
+        "text_field": "text",
+        "split": "test",
+        "pct": 0.10,
+    },
+    {
+        "name": "openai/gsm8k",
+        "config": "main",
+        "text_field": ["question", "answer"],
+        "split": "train",
+        "pct": 0.10,
+    },
+]
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.normalizers import Sequence, NFKC, Strip
@@ -53,6 +89,16 @@ class TokenizerMeta:
     pad_token_id: int
     unk_token: str
     unk_token_id: int
+    fast_token: str
+    fast_token_id: int
+    reason_token: str
+    reason_token_id: int
+    deep_token: str
+    deep_token_id: int
+    think_token: str
+    think_token_id: int
+    end_think_token: str
+    end_think_token_id: int
     datasets: list[str]
     text_fields: list[str]
     sample_docs: int
@@ -64,32 +110,14 @@ class TokenizerMeta:
 def parse_args():
     p = argparse.ArgumentParser(description="Train custom tokenizer for NSVSA-HA")
 
-    p.add_argument("--out_dir", default="tokenizers/vsa48k_en_code")
-    p.add_argument("--name", default="vsa48k_en_code")
-    p.add_argument("--vocab_size", type=int, default=48_000)
+    p.add_argument("--out_dir", default="tokenizers/vsa65k_mix")
+    p.add_argument("--name", default="vsa65k_mix")
+    p.add_argument("--vocab_size", type=int, default=65_000)
     p.add_argument("--min_frequency", type=int, default=2)
     p.add_argument("--sample_docs", type=int, default=2_000_000,
                    help="Max total documents sampled across datasets")
     p.add_argument("--seed", type=int, default=42)
 
-    p.add_argument(
-        "--datasets",
-        nargs="+",
-        default=["HuggingFaceFW/fineweb-edu"],
-        help="HF dataset names, sampled round-robin",
-    )
-    p.add_argument(
-        "--splits",
-        nargs="+",
-        default=["train"],
-        help="One split for all datasets, or one per dataset",
-    )
-    p.add_argument(
-        "--text_fields",
-        nargs="+",
-        default=["text", "code"],
-        help="Candidate text fields; first present field per example is used",
-    )
     p.add_argument("--streaming", action="store_true", default=True)
     p.add_argument("--no_streaming", action="store_true")
     p.add_argument("--shuffle_buffer", type=int, default=10000)
@@ -97,71 +125,85 @@ def parse_args():
     return p.parse_args()
 
 
-def build_dataset_iters(args) -> tuple[list[Iterator[dict]], list[str]]:
+def build_dataset_iters(args) -> tuple[list[dict], list[str]]:
     streaming = args.streaming and not args.no_streaming
-
-    if len(args.splits) == 1:
-        splits = args.splits * len(args.datasets)
-    else:
-        if len(args.splits) != len(args.datasets):
-            raise ValueError("--splits must have length 1 or match --datasets length")
-        splits = args.splits
-
-    iters = []
+    
+    iters_info = []
     loaded_names: list[str] = []
-    for ds_name, split in zip(args.datasets, splits):
-        print(f"Loading dataset: {ds_name} [{split}] (streaming={streaming})")
+    
+    for cfg in CORPUS_CONFIG:
+        ds_name = cfg["name"]
+        split = cfg.get("split", "train")
+        config_name = cfg.get("config", None)
+        pct = cfg.get("pct", 1.0)
+        
+        print(f"Loading dataset: {ds_name} [{config_name or "default"}, {split}] (pct={pct}, streaming={streaming})")
         try:
-            ds = load_dataset(ds_name, split=split, streaming=streaming)
+            if config_name:
+                ds = load_dataset(ds_name, config_name, split=split, streaming=streaming)
+            else:
+                ds = load_dataset(ds_name, split=split, streaming=streaming)
+                
             if streaming:
                 ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-            iters.append(iter(ds))
-            loaded_names.append(ds_name)
+            
+            iters_info.append({
+                "iter": iter(ds),
+                "cfg": cfg,
+                "weight": pct
+            })
+            loaded_names.append(f"{ds_name} ({config_name})")
         except Exception as exc:
             print(f"  ⚠ Skipping dataset '{ds_name}': {exc}")
 
-    if not iters:
-        raise RuntimeError(
-            "No datasets could be loaded. Please pass supported HF parquet-style datasets "
-            "via --datasets."
-        )
+    if not iters_info:
+        raise RuntimeError("No datasets could be loaded.")
 
-    return iters, loaded_names
+    return iters_info, loaded_names
 
 
-def pick_text(example: dict, text_fields: list[str]) -> str:
-    for field in text_fields:
-        value = example.get(field)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+def extract_text(example: dict, text_field: str | list[str]) -> str:
+    if isinstance(text_field, list):
+        parts = [example.get(f, "") for f in text_field]
+        return "\n\n".join(p for p in parts if p and isinstance(p, str))
+    val = example.get(text_field, "")
+    return val if isinstance(val, str) else ""
 
 
-def text_iterator(args, iters: list[Iterator[dict]]) -> Iterator[str]:
+def text_iterator(args, iters_info: list[dict]) -> Iterator[str]:
     random.seed(args.seed)
-    num_datasets = len(iters)
-
+    
+    weights = [info["weight"] for info in iters_info]
+    total_weight = sum(weights)
+    probs = [w / total_weight for w in weights]
+    indices = list(range(len(iters_info)))
+    
     produced = 0
-    ds_index = 0
-    while produced < args.sample_docs:
-        it = iters[ds_index]
+    while produced < args.sample_docs and indices:
+        idx = random.choices(indices, weights=probs, k=1)[0]
+        actual_idx = indices.index(idx)
+        info = iters_info[actual_idx]
+        
         try:
-            ex = next(it)
+            ex = next(info["iter"])
         except StopIteration:
-            ds_index = (ds_index + 1) % num_datasets
+            iters_info.pop(actual_idx)
+            indices.pop(actual_idx)
+            weights.pop(actual_idx)
+            if not indices:
+                break
+            total_weight = sum(weights)
+            probs = [w / total_weight for w in weights]
             continue
         except Exception:
-            ds_index = (ds_index + 1) % num_datasets
             continue
 
-        text = pick_text(ex, args.text_fields)
+        text = extract_text(ex, info["cfg"]["text_field"]).strip()
         if text:
             yield text
             produced += 1
             if produced % 100_000 == 0:
                 print(f"  collected {produced:,} docs...")
-
-        ds_index = (ds_index + 1) % num_datasets
 
 
 def main():
@@ -176,6 +218,11 @@ def main():
         "<|pad|>",
         "<|bos|>",
         "<|endoftext|>",
+        "<|fast|>",
+        "<|reason|>",
+        "<|deep|>",
+        "<|think|>",
+        "<|/think|>",
     ]
 
     tokenizer = Tokenizer(BPE(unk_token="<|unk|>"))
@@ -208,8 +255,13 @@ def main():
     pad_id = tokenizer.token_to_id("<|pad|>")
     bos_id = tokenizer.token_to_id("<|bos|>")
     eot_id = tokenizer.token_to_id("<|endoftext|>")
+    fast_id = tokenizer.token_to_id("<|fast|>")
+    reason_id = tokenizer.token_to_id("<|reason|>")
+    deep_id = tokenizer.token_to_id("<|deep|>")
+    think_id = tokenizer.token_to_id("<|think|>")
+    end_think_id = tokenizer.token_to_id("<|/think|>")
 
-    if any(x is None for x in [unk_id, pad_id, bos_id, eot_id]):
+    if any(x is None for x in [unk_id, pad_id, bos_id, eot_id, fast_id, reason_id, deep_id, think_id, end_think_id]):
         raise RuntimeError("Special token IDs missing after training")
 
     meta = TokenizerMeta(
@@ -224,8 +276,18 @@ def main():
         pad_token_id=int(pad_id),
         unk_token="<|unk|>",
         unk_token_id=int(unk_id),
-        datasets=args.datasets,
-        text_fields=args.text_fields,
+        fast_token="<|fast|>",
+        fast_token_id=int(fast_id),
+        reason_token="<|reason|>",
+        reason_token_id=int(reason_id),
+        deep_token="<|deep|>",
+        deep_token_id=int(deep_id),
+        think_token="<|think|>",
+        think_token_id=int(think_id),
+        end_think_token="<|/think|>",
+        end_think_token_id=int(end_think_id),
+        datasets=[cfg["name"] for cfg in CORPUS_CONFIG],
+        text_fields=[str(cfg.get("text_field", "")) for cfg in CORPUS_CONFIG],
         sample_docs=args.sample_docs,
         min_frequency=args.min_frequency,
         seed=args.seed,

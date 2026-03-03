@@ -113,6 +113,7 @@ class LocalWindowedAttention(nn.Module):
     # Mask building
     # ------------------------------------------------------------------
 
+    @torch._dynamo.disable
     def _get_causal_window_mask(
         self, seq_len: int, device: torch.device
     ) -> torch.Tensor:
@@ -120,6 +121,11 @@ class LocalWindowedAttention(nn.Module):
         Additive bias mask: 0 for allowed positions, -inf for forbidden.
 
         Shape: [1, 1, seq_len, seq_len]
+
+        @torch._dynamo.disable makes this function opaque to AOT autograd:
+        the returned tensor enters the compiled region as a plain constant,
+        so its view chain (.unsqueeze/masked_fill) is never tracked by
+        functionalization — which was causing corrupt view metadata replays.
         """
         key = (seq_len, str(device))
         if key in self._attn_mask_cache:
@@ -147,6 +153,7 @@ class LocalWindowedAttention(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
+    @torch._dynamo.disable
     def forward(
         self,
         x: torch.Tensor,                          # [B, L, d_model]

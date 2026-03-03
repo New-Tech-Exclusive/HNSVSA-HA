@@ -27,13 +27,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # noqa: F811 (field used in config)
 
 from .hybrid_layer import HybridNSVSALayerStack
 from .rope import RotaryEmbedding
 from .cache import ModelCache
-from .reasoning import ReasoningBlock, ponder_loss_fn
 from .rmsnorm import RMSNorm
+from .modes import MODE_FAST, MODE_REASON, MODE_DEEP, NUM_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -71,39 +71,24 @@ class HybridNSVSAConfig:
     # VSA gate
     gate_init_bias: float = 0.0  # sigmoid(bias) = initial VSA contribution
 
-    # Reasoning (PonderNet-style adaptive computation)
-    reasoning_layers: int = 0       # Top R layers form the reasoning block (0 = off)
-    max_reason_steps: int = 8       # Maximum pondering iterations
-    reason_hidden_dim: int = 256    # ReasoningController MLP hidden size
-    ponder_lambda: float = 0.01     # Weight for ponder KL loss
-    ponder_p_geo: float = 0.5       # Geometric prior parameter
-    reason_epsilon: float = 0.01    # Halt threshold for inference early-stop
-
     # Misc
     layer_norm_eps: float = 1e-6
     tie_weights: bool = True    # Tie input embedding ↔ LM head weights
     rope_base: float = 10_000.0 # RoPE frequency base
 
+    # Mode tokens (thinking level control)
+    mode_token_ids: Dict[int, int] = field(default_factory=dict)  # mode_id → token_id
+    default_mode: int = MODE_FAST
+
     def __post_init__(self):
         assert self.d_model % self.num_heads == 0, \
             f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})"
         assert self.d_model % 2 == 0, "d_model must be even for RoPE"
-        assert 0 <= self.reasoning_layers <= self.num_layers, \
-            f"reasoning_layers ({self.reasoning_layers}) must be in [0, num_layers ({self.num_layers})]"
         # Resolve num_kv_heads: 0 means same as num_heads (standard MHA)
         if self.num_kv_heads == 0:
             object.__setattr__(self, 'num_kv_heads', self.num_heads)
         assert self.num_heads % self.num_kv_heads == 0, \
             f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
-
-    @property
-    def reasoning_enabled(self) -> bool:
-        return self.reasoning_layers > 0
-
-    @property
-    def base_layers(self) -> int:
-        """Number of non-reasoning (base) layers."""
-        return self.num_layers - self.reasoning_layers
 
     @property
     def num_macro_positions(self) -> int:
@@ -165,16 +150,12 @@ class HybridNSVSA(nn.Module):
         # ── LM head ──────────────────────────────────────────────────
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # ── Reasoning block (PonderNet) ─────────────────────────────
-        self.reasoning_block: Optional[ReasoningBlock] = None
-        if config.reasoning_enabled:
-            self.reasoning_block = ReasoningBlock(
-                d_model=config.d_model,
-                max_steps=config.max_reason_steps,
-                hidden_dim=config.reason_hidden_dim,
-                p_geometric=config.ponder_p_geo,
-                epsilon=config.reason_epsilon,
-            )
+        # ── Mode token detection lookup ─────────────────────────────
+        # Reverse map: token_id → mode_id for fast scanning
+        self._token_to_mode: Dict[int, int] = {
+            tok_id: mode_id for mode_id, tok_id in config.mode_token_ids.items()
+        }
+        self._mode_token_set = set(config.mode_token_ids.values())
 
         # Weight tying (halves parameters, improves generalization)
         if config.tie_weights:
@@ -250,6 +231,36 @@ class HybridNSVSA(nn.Module):
                                               self.config.d_model)
 
     # ------------------------------------------------------------------
+    # Mode detection
+    # ------------------------------------------------------------------
+
+    def _detect_mode_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Scan input_ids for mode control tokens (<|fast|>, <|reason|>, <|deep|>).
+
+        Returns [B] tensor of mode IDs.  If a sequence has no mode token,
+        it defaults to config.default_mode.  If multiple are present, the
+        *first* one wins.
+        """
+        B = input_ids.shape[0]
+        device = input_ids.device
+        default = self.config.default_mode
+        mode_ids = torch.full((B,), default, dtype=torch.long, device=device)
+
+        if not self._mode_token_set:
+            return mode_ids
+
+        for b in range(B):
+            row = input_ids[b]
+            for tok_id_int in self._mode_token_set:
+                mask = (row == tok_id_int)
+                if mask.any():
+                    mode_ids[b] = self._token_to_mode[tok_id_int]
+                    break  # first mode token wins
+
+        return mode_ids
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -260,6 +271,7 @@ class HybridNSVSA(nn.Module):
         cache: Optional[ModelCache] = None,            # generation cache
         use_cache: bool = False,                       # build / update cache?
         return_hidden_states: bool = False,
+        mode_ids: Optional[torch.Tensor] = None,      # [B] mode per element
     ) -> Dict[str, Any]:
         """
         Args:
@@ -273,20 +285,26 @@ class HybridNSVSA(nn.Module):
             use_cache:           If True, return a "cache" key in the output
                                  dict for subsequent cached forward calls.
             return_hidden_states: If True, include intermediate tensors.
+            mode_ids:            [B] int tensor of reasoning modes.
+                                 None = auto-detect from input_ids control tokens.
 
         Returns dict with keys:
             logits:         [B, L, vocab_size]
-            loss:           scalar (if labels provided, includes ponder_cost)
-            ponder_cost:    scalar (if reasoning enabled)
-            mean_steps:     scalar mean reasoning steps (if reasoning enabled)
+            loss:           scalar (if labels provided)
+            mode_ids:       [B] detected or provided mode IDs
             cache:          ModelCache (if use_cache)
             vsa_states:     list of per-layer final states (if return_hidden_states)
         """
         B, L = input_ids.shape
         device = input_ids.device
+        cfg = self.config
 
         # ── Embed ────────────────────────────────────────────────────
         x = self.embed_drop(self.embed_norm(self.embedding(input_ids)))  # [B, L, d]
+
+        # ── Detect thinking mode from control tokens ────────────────
+        if mode_ids is None:
+            mode_ids = self._detect_mode_ids(input_ids)           # [B]
 
         # ── Position indices for RoPE inside local attention ────────
         seq_offset = cache.seq_len if cache is not None else 0
@@ -307,73 +325,19 @@ class HybridNSVSA(nn.Module):
             token_seq_positions=seq_positions,
         )
 
-        # ── Decide path: reasoning or standard ──────────────────────
-        cfg = self.config
-        if cfg.reasoning_enabled and self.reasoning_block is not None:
-            # Split: base layers [0, B) + reasoning layers [B, L)
-            base_end = cfg.base_layers
-            reason_start = base_end
-            reason_end = cfg.num_layers
-
-            # Base layer caches
-            base_caches = None
-            if cache is not None and cache.layers is not None:
-                base_caches = cache.layers[:base_end]
-
-            # Run base layers
-            x, base_vsa, new_base_caches = self.layers.forward_partial(
-                x, 0, base_end, **layer_kwargs,
-                layer_caches=base_caches, use_cache=use_cache,
-            )
-
-            # Build reasoning_fn — a closure that runs reasoning layers
-            # Note: during reasoning loop, we don't use/build KV cache
-            # (the loop re-processes the same positions with updated states)
-            def reasoning_fn(h, **_kw):
-                return self.layers.forward_partial(
-                    h, reason_start, reason_end, **layer_kwargs,
-                    layer_caches=None, use_cache=False,
-                )
-
-            # Run reasoning block (PonderNet loop)
-            hidden, ponder_cost, mean_steps = self.reasoning_block(
-                x, reasoning_fn,
-            )
-
-            # Apply final norm
-            hidden = self.layers.final_norm(hidden)
-
-            vsa_states = base_vsa  # Reasoning VSA states vary per step
-            new_layer_caches = new_base_caches
-
-            # For cached generation, also run reasoning layers once (no loop)
-            # to build proper caches for the decode path
-            if use_cache:
-                reason_caches_in = None
-                if cache is not None and cache.layers is not None:
-                    reason_caches_in = cache.layers[base_end:]
-                _, reason_vsa, new_reason_caches = self.layers.forward_partial(
-                    x, reason_start, reason_end, **layer_kwargs,
-                    layer_caches=reason_caches_in, use_cache=True,
-                )
-                vsa_states = base_vsa + reason_vsa
-                if new_layer_caches is not None and new_reason_caches is not None:
-                    new_layer_caches = new_layer_caches + new_reason_caches
-
-        else:
-            # Standard path: all layers in one pass
-            layer_caches = cache.layers if cache is not None else None
-            hidden, vsa_states, new_layer_caches = self.layers(
-                x, local_pos, macro_pos, seq_positions,
-                layer_caches=layer_caches, use_cache=use_cache,
-            )
-            ponder_cost = None
-            mean_steps = None
+        # ── All layers in one pass ───────────────────────────────────
+        layer_caches = cache.layers if cache is not None else None
+        hidden, vsa_states, new_layer_caches = self.layers(
+            x, local_pos, macro_pos, seq_positions,
+            layer_caches=layer_caches, use_cache=use_cache,
+        )
 
         # ── LM head ─────────────────────────────────────────────────
         logits = self.lm_head(hidden)  # [B, L, vocab_size]
 
         output: Dict[str, Any] = {"logits": logits}
+        if mode_ids is not None:
+            output["mode_ids"] = mode_ids
 
         # ── Loss ─────────────────────────────────────────────────────
         if labels is not None:
@@ -385,11 +349,6 @@ class HybridNSVSA(nn.Module):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # Add ponder regularization when reasoning is active
-            if ponder_cost is not None:
-                output["ponder_cost"] = ponder_cost
-                output["mean_reason_steps"] = mean_steps
-                loss = loss + self.config.ponder_lambda * ponder_cost
             output["loss"] = loss
 
         # ── Cache ────────────────────────────────────────────────────
@@ -471,6 +430,54 @@ class HybridNSVSA(nn.Module):
 
     # ------------------------------------------------------------------
     # Utilities
+    # ------------------------------------------------------------------
+    # Vocabulary resizing
+    # ------------------------------------------------------------------
+
+    def resize_token_embeddings(self, new_vocab_size: int) -> None:
+        """
+        Expand the token embedding table and LM head to ``new_vocab_size``.
+
+        New rows are zero-initialised so the new tokens start as neutral.
+        Tied-weight mode is preserved: after resizing the LM head weight is
+        re-pointed at the (new) embedding weight tensor.
+
+        Args:
+            new_vocab_size: Target vocabulary size.  Must be >= current size.
+        """
+        old_vocab = self.config.vocab_size
+        if new_vocab_size == old_vocab:
+            return
+        if new_vocab_size < old_vocab:
+            raise ValueError(
+                f"resize_token_embeddings: new_vocab_size ({new_vocab_size}) "
+                f"must be >= current vocab_size ({old_vocab})."
+            )
+
+        d = self.config.d_model
+        device = self.embedding.weight.device
+        dtype = self.embedding.weight.dtype
+
+        # ── Embed table ─────────────────────────────────────────────
+        new_emb = nn.Embedding(new_vocab_size, d).to(device=device, dtype=dtype)
+        nn.init.zeros_(new_emb.weight)
+        with torch.no_grad():
+            new_emb.weight[:old_vocab] = self.embedding.weight
+        self.embedding = new_emb
+
+        # ── LM head ─────────────────────────────────────────────────
+        new_lm = nn.Linear(d, new_vocab_size, bias=False).to(device=device, dtype=dtype)
+        nn.init.zeros_(new_lm.weight)
+        with torch.no_grad():
+            new_lm.weight[:old_vocab] = self.lm_head.weight
+        self.lm_head = new_lm
+
+        # Re-tie weights if originally tied
+        if self.config.tie_weights:
+            self.lm_head.weight = self.embedding.weight
+
+        self.config.vocab_size = new_vocab_size
+
     # ------------------------------------------------------------------
 
     def num_parameters(self, trainable_only: bool = True) -> int:

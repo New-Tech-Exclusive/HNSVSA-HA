@@ -58,12 +58,17 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, _SCRIPT_DIR)
+
+# Allow CUDA to release / re-use memory segments dynamically.
+# Prevents OOM fragmentation on long runs without extra VRAM overhead.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from nsvsa_ha import HybridNSVSA, HybridNSVSAConfig
 from nsvsa_ha.tokenizer import BaseTokenizer, load_tokenizer, tokenizer_compatible
+from nsvsa_ha.modes import MODE_FAST, MODE_REASON, MODE_DEEP, NUM_MODES, DEFAULT_THINK_FRACS
 
 
-DEFAULT_CUSTOM_TOKENIZER_JSON = "tokenizers/vsa48k_en_code/tokenizer.json"
-DEFAULT_CUSTOM_TOKENIZER_META = "tokenizers/vsa48k_en_code/tokenizer_meta.json"
+DEFAULT_CUSTOM_TOKENIZER_JSON = "tokenizers/vsa65k_mix/tokenizer.json"
+DEFAULT_CUSTOM_TOKENIZER_META = "tokenizers/vsa65k_mix/tokenizer_meta.json"
 
 
 # ─── Curriculum stage ────────────────────────────────────────────────────────
@@ -80,6 +85,9 @@ class CurriculumStage:
     warmup_steps: int   # intra-stage warmup
     start_step: int     # inclusive
     end_step: int       # exclusive
+    cot_mix: float = 0.0  # fraction of batches from CoT dataset (0=none, 1=all CoT)
+    instruction_mix: float = 0.0  # fraction from instruction SFT dataset
+    preference_mix: float = 0.0  # fraction from preference-chosen dataset (RLHF-style SFT)
 
 
 def build_curriculum(args) -> list[CurriculumStage]:
@@ -103,6 +111,9 @@ def build_curriculum(args) -> list[CurriculumStage]:
             warmup_steps=cfg.get("intra_warmup", 200),
             start_step=cursor,
             end_step=cursor + n_steps,
+            cot_mix=float(cfg.get("cot_mix", 0.0)),
+            instruction_mix=float(cfg.get("instruction_mix", 0.0)),
+            preference_mix=float(cfg.get("preference_mix", 0.0)),
         ))
         cursor += n_steps
     return stages
@@ -254,7 +265,8 @@ def build_pretokenized_iterator(
         for shard_idx in shard_order:
             shard_entry = Path(shard_names[int(shard_idx)])
             shard_file = shard_entry if shard_entry.is_absolute() else (data_path / shard_entry)
-            arr = np.load(shard_file, mmap_mode="r")
+            # Load fully into RAM — avoids page-fault overhead on random row access.
+            arr = np.load(shard_file)
             if arr.ndim != 2:
                 raise ValueError(f"Shard {shard_file} must be rank-2 [N, T], got {arr.shape}")
 
@@ -271,6 +283,250 @@ def build_pretokenized_iterator(
                 idx = row_idx[start : start + batch_size]
                 batch_np = np.asarray(arr[idx], dtype=np.int64)
                 yield torch.from_numpy(batch_np)
+
+
+def _blend_iterators(
+    primary: Iterator[torch.Tensor],
+    secondary: Iterator[torch.Tensor],
+    primary_frac: float,
+    rng: np.random.Generator,
+) -> Iterator[torch.Tensor]:
+    """Blend two iterators: yield from primary with probability primary_frac."""
+    while True:
+        if rng.random() < primary_frac:
+            yield next(primary)
+        else:
+            yield next(secondary)
+
+
+def build_cot_iterator(
+    cot_path: str,
+    tokenizer: BaseTokenizer,
+    seq_len: int,
+    batch_size: int,
+    *,
+    seed: int = 42,
+) -> Iterator[torch.Tensor]:
+    """
+    Yields [batch_size, seq_len+1] batches from a CoT text file.
+
+    Each non-blank, non-comment line is a complete example already formatted
+    with a leading mode token and embedded <|think|> ... <|/think|> spans::
+
+        <|reason|> Question <|think|> step-by-step reasoning... <|/think|> Answer.
+        <|deep|> Hard question <|think|> detailed analysis... <|/think|> Answer.
+
+    Lines are tokenized and packed end-to-end with <|endoftext|> separators,
+    matching the main training data format.  The example order is shuffled on
+    every epoch so each packed window contains a varied neighbourhood.
+
+    Because mode tokens and think tokens are already embedded in the text,
+    the training loop must NOT call sample_mode_tokens() on CoT batches.
+    """
+    path = Path(cot_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CoT dataset not found: {cot_path}")
+    lines = [
+        ln.strip()
+        for ln in path.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.startswith("#")
+    ]
+    if not lines:
+        raise ValueError(f"CoT dataset {cot_path} contains no usable lines")
+
+    rng = np.random.default_rng(seed)
+    eot = tokenizer.eot_token
+    total = seq_len + 1
+
+    buf: list[int] = []
+    while True:
+        order = np.arange(len(lines))
+        rng.shuffle(order)
+        for idx in order:
+            tokens = tokenizer.encode(lines[int(idx)])
+            buf.extend(tokens)
+            buf.append(eot)
+            while len(buf) >= total * batch_size:
+                batch = torch.tensor(
+                    [buf[i * total : (i + 1) * total] for i in range(batch_size)],
+                    dtype=torch.long,
+                )
+                buf = buf[total * batch_size :]
+                yield batch
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                rows.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def build_instruction_iterator(
+    instruction_path: str,
+    tokenizer: BaseTokenizer,
+    seq_len: int,
+    batch_size: int,
+    *,
+    seed: int = 42,
+) -> Iterator[torch.Tensor]:
+    """
+    Yields [batch_size, seq_len+1] batches from an instruction dataset.
+
+    Supports:
+      - .jsonl with fields like instruction/prompt/input and output/response/answer
+      - plain text (one preformatted instruction-response example per line)
+    """
+    path = Path(instruction_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Instruction dataset not found: {instruction_path}")
+
+    examples: list[str] = []
+    if path.suffix.lower() == ".jsonl":
+        for obj in _load_jsonl(path):
+            instr = str(
+                obj.get("instruction")
+                or obj.get("prompt")
+                or obj.get("question")
+                or ""
+            ).strip()
+            extra = str(obj.get("input") or "").strip()
+            resp = str(
+                obj.get("output")
+                or obj.get("response")
+                or obj.get("answer")
+                or obj.get("chosen")
+                or ""
+            ).strip()
+            if not instr or not resp:
+                continue
+            if extra:
+                text = f"### Instruction:\n{instr}\n\n### Input:\n{extra}\n\n### Response:\n{resp}"
+            else:
+                text = f"### Instruction:\n{instr}\n\n### Response:\n{resp}"
+            examples.append(text)
+    else:
+        examples = [
+            ln.strip()
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+
+    if not examples:
+        raise ValueError(f"Instruction dataset {instruction_path} contains no usable examples")
+
+    rng = np.random.default_rng(seed)
+    eot = tokenizer.eot_token
+    total = seq_len + 1
+    buf: list[int] = []
+
+    while True:
+        order = np.arange(len(examples))
+        rng.shuffle(order)
+        for idx in order:
+            tokens = tokenizer.encode(examples[int(idx)])
+            buf.extend(tokens)
+            buf.append(eot)
+            while len(buf) >= total * batch_size:
+                batch = torch.tensor(
+                    [buf[i * total : (i + 1) * total] for i in range(batch_size)],
+                    dtype=torch.long,
+                )
+                buf = buf[total * batch_size :]
+                yield batch
+
+
+def build_preference_iterator(
+    preference_path: str,
+    tokenizer: BaseTokenizer,
+    seq_len: int,
+    batch_size: int,
+    *,
+    seed: int = 42,
+) -> Iterator[torch.Tensor]:
+    """
+    Yields [batch_size, seq_len+1] batches from preference data.
+
+    This uses only the preferred (chosen) response as supervised signal,
+    which is an RLHF-style approximation without policy optimization.
+    """
+    path = Path(preference_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Preference dataset not found: {preference_path}")
+
+    examples: list[str] = []
+    if path.suffix.lower() == ".jsonl":
+        for obj in _load_jsonl(path):
+            prompt = str(
+                obj.get("prompt")
+                or obj.get("instruction")
+                or obj.get("question")
+                or ""
+            ).strip()
+            chosen = str(
+                obj.get("chosen")
+                or obj.get("output")
+                or obj.get("response")
+                or obj.get("answer")
+                or ""
+            ).strip()
+            if not chosen:
+                continue
+            if prompt:
+                text = f"### Prompt:\n{prompt}\n\n### Preferred Response:\n{chosen}"
+            else:
+                text = chosen
+            examples.append(text)
+    else:
+        examples = [
+            ln.strip()
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+
+    if not examples:
+        raise ValueError(f"Preference dataset {preference_path} contains no usable examples")
+
+    rng = np.random.default_rng(seed)
+    eot = tokenizer.eot_token
+    total = seq_len + 1
+    buf: list[int] = []
+
+    while True:
+        order = np.arange(len(examples))
+        rng.shuffle(order)
+        for idx in order:
+            tokens = tokenizer.encode(examples[int(idx)])
+            buf.extend(tokens)
+            buf.append(eot)
+            while len(buf) >= total * batch_size:
+                batch = torch.tensor(
+                    [buf[i * total : (i + 1) * total] for i in range(batch_size)],
+                    dtype=torch.long,
+                )
+                buf = buf[total * batch_size :]
+                yield batch
+
+
+def _mix_iterators(
+    iterators: list[Iterator[torch.Tensor]],
+    probs: list[float],
+    rng: np.random.Generator,
+) -> Iterator[torch.Tensor]:
+    """Sample from multiple iterators using categorical probabilities."""
+    p = np.asarray(probs, dtype=np.float64)
+    p = p / p.sum()
+    while True:
+        i = int(rng.choice(len(iterators), p=p))
+        yield next(iterators[i])
 
 
 # ─── Learning-rate schedule ──────────────────────────────────────────────────
@@ -425,11 +681,79 @@ def save_checkpoint(
     print(f"  💾 Saved {path}  (step {step}, stage {stage_idx})")
 
 
+def _expand_vocab_in_state(state: dict, model) -> dict:
+    """
+    If the saved embedding weights are smaller than the model's current
+    vocab_size, zero-pad the embedding.weight (and lm_head.weight if
+    present) so load_state_dict can succeed.  New token rows stay zero.
+    """
+    model_vocab = model.config.vocab_size
+    ckpt_vocab = state["embedding.weight"].shape[0]
+    if ckpt_vocab == model_vocab:
+        return state
+    if ckpt_vocab > model_vocab:
+        raise ValueError(
+            f"Checkpoint vocab ({ckpt_vocab}) > model vocab ({model_vocab}). "
+            "Either bump vocab_size or use the correct checkpoint."
+        )
+    def _pad(w: torch.Tensor) -> torch.Tensor:
+        padded = torch.zeros(model_vocab, w.shape[1], dtype=w.dtype)
+        padded[:ckpt_vocab] = w
+        return padded
+    state = dict(state)  # shallow copy — don't mutate original
+    state["embedding.weight"] = _pad(state["embedding.weight"])
+    if "lm_head.weight" in state:
+        state["lm_head.weight"] = _pad(state["lm_head.weight"])
+    print(f"  vocab expanded: {ckpt_vocab} → {model_vocab} (new tokens zero-initialised)")
+    return state
+
+
 def load_checkpoint(path: Path, model, optimizer=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    state = ckpt["model"]
+    # Strip _orig_mod. prefix added by torch.compile when saving
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    # Expand vocabulary if tokenizer has grown since the checkpoint was saved
+    vocab_expanded = state["embedding.weight"].shape[0] < model.config.vocab_size
+    state = _expand_vocab_in_state(state, model)
+    model.load_state_dict(state)
+    # Re-tie lm_head → embedding after load_state_dict (which breaks the tie)
+    if model.config.tie_weights:
+        model.lm_head.weight = model.embedding.weight
     if optimizer and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            if vocab_expanded:
+                print(f"  WARNING: optimizer state not restored after vocab expansion "
+                      f"({exc}).  Optimizer starts fresh for embedding/lm_head.")
+            else:
+                raise
+        else:
+            # After load_state_dict the moment tensors (exp_avg, exp_avg_sq) may
+            # have the OLD vocab size while the model parameters have grown.
+            # Fused AdamW requires them to match — pad any mismatched moments now.
+            if vocab_expanded:
+                fixed = 0
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p not in optimizer.state:
+                            continue
+                        pstate = optimizer.state[p]
+                        for key in ("exp_avg", "exp_avg_sq"):
+                            m = pstate.get(key)
+                            if m is None or m.shape == p.shape:
+                                continue
+                            if m.ndim >= 1 and m.shape[0] < p.shape[0]:
+                                # Pad first dimension (vocab rows) with zeros
+                                new_m = torch.zeros(p.shape, dtype=m.dtype, device=m.device)
+                                idx = (slice(m.shape[0]),) + (slice(None),) * (m.ndim - 1)
+                                new_m[idx] = m
+                                pstate[key] = new_m
+                                fixed += 1
+                if fixed:
+                    print(f"  optimizer moments padded: {fixed} tensor(s) grown to match new vocab")
     return (
         ckpt.get("step", 0),
         ckpt.get("best_val_loss", float("inf")),
@@ -517,6 +841,96 @@ def evaluate(model, val_iter, val_steps: int, device, ctx) -> float:
     return total_loss / max(n, 1)
 
 
+# ─── Mode-conditioned training helpers ───────────────────────────────────────
+
+def sample_mode_tokens(
+    batch: torch.Tensor,
+    mode_token_ids: dict[int, int],
+    mode_mix: tuple[float, float, float] = (0.50, 0.30, 0.20),
+    rng: np.random.Generator | None = None,
+    think_token_id: int | None = None,
+    end_think_token_id: int | None = None,
+    think_fracs: dict[int, float] | None = None,
+) -> torch.Tensor:
+    """
+    Prepend a mode control token to each sequence and optionally inject
+    a think block based on the mode's thinking level:
+
+        fast   → [fast_tok] [seq …]                      (no thinking)
+        reason → [reason_tok] <|think|> [seq[:t]] <|/think|> [seq[t:L-2]]
+        deep   → [deep_tok]  <|think|> [seq[:t]] <|/think|> [seq[t:L-2]]
+
+    The think block length is proportional to the mode's think_frac:
+        fast=0%, reason=~25%, deep=~50% of the sequence.
+
+    All output rows have the same length L+1.
+
+    Args:
+        batch:              [B, L] token IDs.
+        mode_token_ids:     {mode_id: token_id} mapping.
+        mode_mix:           (p_fast, p_reason, p_deep) probabilities.
+        rng:                Optional numpy RNG for reproducibility.
+        think_token_id:     ID of <|think|> token, or None to skip think blocks.
+        end_think_token_id: ID of <|/think|> token, or None to skip think blocks.
+        think_fracs:        {mode_id: fraction} of tokens devoted to thinking.
+                            Defaults to DEFAULT_THINK_FRACS.
+
+    Returns:
+        [B, L+1] tensor with mode token (and optional think block) prepended.
+    """
+    B, L = batch.shape
+    if rng is None:
+        rng = np.random.default_rng()
+    if think_fracs is None:
+        think_fracs = DEFAULT_THINK_FRACS
+
+    modes = [MODE_FAST, MODE_REASON, MODE_DEEP]
+    probs = np.array(mode_mix, dtype=np.float64)
+    probs /= probs.sum()
+    sampled_modes = rng.choice(modes, size=B, p=probs)
+
+    use_think = (
+        think_token_id is not None
+        and end_think_token_id is not None
+        and L >= 8
+    )
+
+    result_rows: list[torch.Tensor] = []
+    for i, mode in enumerate(sampled_modes):
+        mode_tok = mode_token_ids[int(mode)]
+        row = batch[i]  # [L]
+
+        frac = think_fracs.get(int(mode), 0.0)
+
+        if use_think and frac > 0.0:
+            # Sample think-block length around the target fraction
+            # with ±10% jitter, clamped to [2, L-4]
+            lo = max(2, int((frac - 0.10) * L))
+            hi = max(lo + 1, int((frac + 0.10) * L))
+            hi = min(hi, L - 4)
+            lo = min(lo, hi - 1)
+            t = int(rng.integers(lo, hi))
+            # Resulting length: 2 + t + 1 + (L - t - 2) = L + 1
+            head = torch.tensor(
+                [mode_tok, think_token_id],
+                dtype=batch.dtype, device=batch.device,
+            )
+            sep = torch.tensor(
+                [end_think_token_id],
+                dtype=batch.dtype, device=batch.device,
+            )
+            row_out = torch.cat([head, row[:t], sep, row[t:L - 2]], dim=0)
+        else:
+            row_out = torch.cat([
+                torch.tensor([mode_tok], dtype=batch.dtype, device=batch.device),
+                row,
+            ], dim=0)  # [L+1]
+
+        result_rows.append(row_out)
+
+    return torch.stack(result_rows, dim=0)  # [B, L+1]
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -542,6 +956,12 @@ def parse_args():
                    help="Shuffle rows/shards in pretokenized mode")
     p.add_argument("--no_pretokenized_shuffle", action="store_true",
                    help="Disable shuffling for pretokenized mode")
+    p.add_argument("--cot_dataset", default="data/cot/cot_examples.txt",
+                   help="Path to CoT text file for think-token supervision (Stage 3)")
+    p.add_argument("--instruction_dataset", default="data/instruction/high_quality_instruction.jsonl",
+                   help="Path to instruction-tuning dataset (.jsonl or .txt)")
+    p.add_argument("--preference_dataset", default="data/preference/high_quality_preference.jsonl",
+                   help="Path to preference dataset (.jsonl or .txt), using chosen responses")
 
     # Model
     p.add_argument("--d_model",      type=int, default=512)
@@ -578,10 +998,18 @@ def parse_args():
                    help="Gradient multiplier for VSA params (counteracts EMA attenuation)")
     p.add_argument("--gate_init_bias", type=float, default=0.0,
                    help="Initial bias for vsa_gate; sigmoid(bias) = starting VSA contribution")
-    p.add_argument("--grad_clip",    type=float, default=1.0)
+    p.add_argument("--grad_clip",    type=float, default=0.5)
     p.add_argument("--beta1",        type=float, default=0.9)
-    p.add_argument("--beta2",        type=float, default=0.95,
-                   help="Lower β₂ (0.95 vs 0.999) = faster adaptation, standard for LLMs")
+    p.add_argument("--beta2",        type=float, default=0.90,
+                   help="Lower β₂ (0.90 vs 0.999) = faster adaptation, natural damper against gradient spikes")
+    p.add_argument("--reason_warmup_steps", type=int, default=0,
+                   help="(deprecated) No longer used — kept for config compat")
+    p.add_argument("--mode_mix", type=str, default="0.50,0.30,0.20",
+                   help="Mode sampling probabilities: p_fast,p_reason,p_deep (comma-separated)")
+    p.add_argument("--enable_mode_training", action="store_true", default=True,
+                   help="Prepend mode control tokens and inject think blocks per mode")
+    p.add_argument("--no_mode_training", action="store_true",
+                   help="Disable mode-conditioned training")
 
     # Eval / logging
     p.add_argument("--eval_interval",  type=int, default=500)
@@ -684,6 +1112,12 @@ def main():
     dtype  = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     ctx    = torch.amp.autocast(device_type="cuda", dtype=dtype)
 
+    # TF32: ~10-15% faster matmuls on Ampere+ at negligible precision cost.
+    # torch.compile exploits this heavily; harmless on older GPUs.
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     print(f"Device: {device}  |  AMP dtype: {dtype}")
 
     # ── Tokenizer ────────────────────────────────────────────────────
@@ -710,27 +1144,70 @@ def main():
     assert args.vocab_size == tokenizer.n_vocab, \
         f"vocab_size ({args.vocab_size}) != tokenizer ({tokenizer.n_vocab})"
 
-    # ── Model ────────────────────────────────────────────────────────
+    # ── Model config ─────────────────────────────────────────────────
+    # When resuming, the checkpoint carries the saved architecture.
+    # We read it here (before model creation) so the model is built
+    # with exactly the right shape, then load_checkpoint() fills the
+    # weights.  Training hyper-params (LR, schedule, batch) still come
+    # from args / training_config.py so you can change them freely.
+    # vocab_size always comes from the current tokenizer so the new
+    # <|think|>/<|/think|> rows are automatically included.
+    _ckpt_cfg: dict = {}
+    if args.resume:
+        _resume_path = Path(args.resume)
+        if not _resume_path.exists():
+            raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
+        print(f"Peeking at checkpoint config: {args.resume}")
+        _peek = torch.load(_resume_path, map_location="cpu", weights_only=False)
+        _ckpt_cfg = _peek.get("config", {})
+        del _peek   # free RAM; load_checkpoint() re-reads the file later
+
+    def _arch(key, fallback):
+        """Return checkpoint value if resuming, else the fallback from args."""
+        return _ckpt_cfg[key] if key in _ckpt_cfg else fallback
+
     config = HybridNSVSAConfig(
-        d_model=args.d_model,
+        # ── Architecture: from checkpoint when resuming ───────────
+        d_model=_arch("d_model", args.d_model),
+        num_layers=_arch("num_layers", args.num_layers),
+        num_heads=_arch("num_heads", args.num_heads),
+        max_seq_len=_arch("max_seq_len", args.max_seq_len),
+        window_size=_arch("window_size", args.window_size),
+        group_size=_arch("group_size", args.group_size),
+        ffn_ratio=_arch("ffn_ratio", args.ffn_ratio),
+        dropout=_arch("dropout", args.dropout),
+        gate_init_bias=_arch("gate_init_bias", args.gate_init_bias),
+        num_kv_heads=_arch("num_kv_heads", getattr(args, "num_kv_heads", 0)),
+        qk_norm=_arch("qk_norm", getattr(args, "qk_norm", True)),
+        learned_vsa_positions=_arch("learned_vsa_positions", getattr(args, "learned_vsa_positions", True)),
+        # ── Vocabulary: always from current tokenizer (allows growth) ─
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        max_seq_len=args.max_seq_len,
-        window_size=args.window_size,
-        group_size=args.group_size,
-        ffn_ratio=args.ffn_ratio,
-        dropout=args.dropout,
-        gate_init_bias=args.gate_init_bias,
-        num_kv_heads=getattr(args, "num_kv_heads", 0),
-        qk_norm=getattr(args, "qk_norm", True),
-        learned_vsa_positions=getattr(args, "learned_vsa_positions", True),
-        reasoning_layers=getattr(args, "reasoning_layers", 0),
-        max_reason_steps=getattr(args, "max_reason_steps", 8),
-        reason_hidden_dim=getattr(args, "reason_hidden_dim", 256),
-        ponder_lambda=getattr(args, "ponder_lambda", 0.01),
-        ponder_p_geo=getattr(args, "ponder_p_geo", 0.5),
     )
+
+    # ── Mode-conditioned training setup ──────────────────────────────
+    # Resolve mode token IDs from tokenizer metadata → config
+    if hasattr(tokenizer, "mode_token_ids"):
+        tok_mode_ids = tokenizer.mode_token_ids()
+        if tok_mode_ids:
+            config.mode_token_ids = tok_mode_ids
+
+    use_mode_training = (
+        getattr(args, "enable_mode_training", False)
+        and not getattr(args, "no_mode_training", False)
+        and bool(config.mode_token_ids)
+    )
+    mode_mix = tuple(float(x) for x in getattr(args, "mode_mix", "0.50,0.30,0.20").split(","))
+    assert len(mode_mix) == 3, f"mode_mix must have 3 values, got {len(mode_mix)}"
+    mode_rng  = np.random.default_rng(42)
+    blend_rng = np.random.default_rng(77)   # for CoT/pretok blending in Stage 3
+    cot_path  = getattr(args, "cot_dataset", None)
+    instruction_path = getattr(args, "instruction_dataset", None)
+    preference_path = getattr(args, "preference_dataset", None)
+
+    # Think token IDs for injecting think blocks into reason/deep batches
+    think_token_id     = getattr(tokenizer, "think_token_id", None)
+    end_think_token_id = getattr(tokenizer, "end_think_token_id", None)
+    use_think_training = use_mode_training and think_token_id is not None and end_think_token_id is not None
 
     model = HybridNSVSA(config).to(device)
     n_params = model.num_parameters()
@@ -741,17 +1218,26 @@ def main():
           f"QK-Norm={'on' if config.qk_norm else 'off'}, "
           f"LearnedVSAPos={'on' if config.learned_vsa_positions else 'off'}, "
           f"RMSNorm=on")
-    if config.reasoning_enabled:
-        print(f"Reasoning: {config.reasoning_layers} layers, max {config.max_reason_steps} steps, "
-              f"λ_ponder={config.ponder_lambda}")
+    if use_mode_training:
+        print(f"Mode training: ON  mix=(fast:{mode_mix[0]:.0%}, reason:{mode_mix[1]:.0%}, deep:{mode_mix[2]:.0%})")
+        print(f"  Thinking levels: fast=none, reason=~{DEFAULT_THINK_FRACS[MODE_REASON]:.0%}, deep=~{DEFAULT_THINK_FRACS[MODE_DEEP]:.0%}")
+        if use_think_training:
+            print(f"  Think-block training: ON  think={think_token_id}  end_think={end_think_token_id}")
+        else:
+            print("  Think-block training: OFF (think tokens not in tokenizer)")
+    else:
+        print("Mode training: OFF")
 
-    # ── VSA gradient scaling hook ────────────────────────────────────
+    # ── VSA gradient scaling ─────────────────────────────────────────
+    # Collect VSA params once; scale applied after clip via foreach_mul_
+    # (one fused CUDA kernel) instead of a per-tensor hook per backward.
     vsa_grad_scale = getattr(args, "vsa_grad_scale", 1.0)
+    vsa_params = [
+        p for name, p in model.named_parameters()
+        if "soft_vsa" in name and p.requires_grad
+    ]
     if vsa_grad_scale != 1.0:
-        for name, p in model.named_parameters():
-            if "soft_vsa" in name and p.requires_grad:
-                p.register_hook(lambda g, s=vsa_grad_scale: g * s)
-        print(f"VSA gradient scale: {vsa_grad_scale}x")
+        print(f"VSA gradient scale: {vsa_grad_scale}x  ({len(vsa_params)} tensors, applied post-clip)")
 
     # ── Optimizer ────────────────────────────────────────────────────
     param_groups = make_param_groups(model, args.max_lr, args.weight_decay, args.vsa_lr_scale)
@@ -761,7 +1247,10 @@ def main():
         fused=True,   # fused AdamW kernel — faster on CUDA
     )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+    # bf16 doesn't overflow so GradScaler is unnecessary overhead.
+    # fp16 path kept for completeness; on this GPU bf16 is always used.
+    use_scaler = (dtype == torch.float16)
+    scaler = torch.amp.GradScaler("cuda") if use_scaler else None
 
     # ── Curriculum stages ────────────────────────────────────────────
     if use_curriculum:
@@ -775,9 +1264,17 @@ def main():
           f"{len(stages)} stage(s), {args.max_steps} total steps")
     for s in stages:
         eff_batch = s.batch_size * s.grad_accum
+        tags = []
+        if s.cot_mix > 0:
+            tags.append(f"CoT {s.cot_mix*100:.0f}%")
+        if s.instruction_mix > 0:
+            tags.append(f"Instr {s.instruction_mix*100:.0f}%")
+        if s.preference_mix > 0:
+            tags.append(f"Pref {s.preference_mix*100:.0f}%")
+        mix_tag = f"  [{' | '.join(tags)}]" if tags else ""
         print(f"  Stage {s.index}: steps [{s.start_step}, {s.end_step})  "
               f"seq_len={s.seq_len}  batch={s.batch_size}×{s.grad_accum}={eff_batch}  "
-              f"lr={s.max_lr:.1e}→{s.min_lr:.1e}  warmup={s.warmup_steps}")
+              f"lr={s.max_lr:.1e}→{s.min_lr:.1e}  warmup={s.warmup_steps}{mix_tag}")
 
     # ── Resume ───────────────────────────────────────────────────────
     start_step = 0
@@ -795,6 +1292,11 @@ def main():
             if args.strict_tokenizer_match:
                 raise ValueError(msg)
             print(f"WARNING: {msg}")
+        elif ckpt_tok:
+            ckpt_vocab = int(ckpt_tok.get("vocab_size", 0))
+            run_vocab  = int(tok_info.get("vocab_size", 0))
+            if run_vocab > ckpt_vocab:
+                print(f"  tokenizer vocab expanded: {ckpt_vocab} → {run_vocab} (OK)")
         print(f"Resumed from step {start_step}, best val loss {best_val:.4f}, stage {resumed_stage_idx}")
 
     # ── Compile ──────────────────────────────────────────────────────
@@ -805,21 +1307,32 @@ def main():
         print("Skipping torch.compile: not supported on Python 3.14+")
     elif compile_requested:
         try:
-            print("Compiling model with torch.compile...")
-            model = torch.compile(model)
+            # "default" mode: full kernel fusion + graph optimization, no CUDA graphs.
+            # "reduce-overhead" (CUDA graphs) requires static tensor addresses but this
+            # model has dynamic caches, conditional reasoning loops, and mask buffers
+            # that alias into graph memory — causing corrupted view metadata crashes.
+            print("Compiling model with torch.compile (default)...")
+            model = torch.compile(model, mode="default")
         except RuntimeError as exc:
             print(f"Skipping torch.compile due to runtime error: {exc}")
 
     # ── Data iterator factories ──────────────────────────────────────
     data_mode = args.data_mode
 
-    def make_train_iter(seq_len: int, batch_size: int):
+    def make_train_iter(
+        seq_len: int,
+        batch_size: int,
+        *,
+        cot_mix: float = 0.0,
+        instruction_mix: float = 0.0,
+        preference_mix: float = 0.0,
+    ):
         if data_mode == "synthetic":
-            return build_synthetic_iterator(
+            base = build_synthetic_iterator(
                 vocab_size=args.vocab_size,
                 seq_len=seq_len, batch_size=batch_size,
             )
-        if data_mode == "pretokenized":
+        elif data_mode == "pretokenized":
             if use_curriculum:
                 d = args.pretokenized_dir_pattern.format(
                     split="train", seq_len=seq_len,
@@ -832,15 +1345,41 @@ def main():
                     )
             else:
                 d = args.pretokenized_train_dir
-            return build_pretokenized_iterator(
+            base = build_pretokenized_iterator(
                 d, batch_size=batch_size,
                 seed=42, shuffle=pretokenized_shuffle,
             )
-        return build_token_iterator(
-            args.dataset, args.split, tokenizer,
-            seq_len=seq_len, batch_size=batch_size,
-            text_field=args.text_field,
-        )
+        else:
+            base = build_token_iterator(
+                args.dataset, args.split, tokenizer,
+                seq_len=seq_len, batch_size=batch_size,
+                text_field=args.text_field,
+            )
+        iters: list[Iterator[torch.Tensor]] = []
+        probs: list[float] = []
+
+        base_weight = max(0.0, 1.0 - cot_mix - instruction_mix - preference_mix)
+        if base_weight > 0.0:
+            iters.append(base)
+            probs.append(base_weight)
+
+        if cot_mix > 0.0 and cot_path and Path(cot_path).exists():
+            iters.append(build_cot_iterator(cot_path, tokenizer, seq_len, batch_size, seed=43))
+            probs.append(cot_mix)
+
+        if instruction_mix > 0.0 and instruction_path and Path(instruction_path).exists():
+            iters.append(build_instruction_iterator(instruction_path, tokenizer, seq_len, batch_size, seed=44))
+            probs.append(instruction_mix)
+
+        if preference_mix > 0.0 and preference_path and Path(preference_path).exists():
+            iters.append(build_preference_iterator(preference_path, tokenizer, seq_len, batch_size, seed=45))
+            probs.append(preference_mix)
+
+        if not iters:
+            return base
+        if len(iters) == 1:
+            return iters[0]
+        return _mix_iterators(iters, probs, blend_rng)
 
     def make_val_iter(seq_len: int, batch_size: int):
         if data_mode == "synthetic":
@@ -886,27 +1425,39 @@ def main():
 
     # ── Initialise for first stage ───────────────────────────────────
     current_stage = get_stage_for_step(start_step, stages)
-    train_iter = make_train_iter(current_stage.seq_len, current_stage.batch_size)
+    train_iter = make_train_iter(
+        current_stage.seq_len,
+        current_stage.batch_size,
+        cot_mix=current_stage.cot_mix,
+        instruction_mix=current_stage.instruction_mix,
+        preference_mix=current_stage.preference_mix,
+    )
 
     # ── Training loop ────────────────────────────────────────────────
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
     accum_loss = 0.0
-    accum_ponder = 0.0
-    accum_reason_steps = 0.0
     t0 = time.perf_counter()
     tokens_seen = 0
     ckpt_dir = Path(args.checkpoint_dir)
+
+    # Loss-spike detection: skip optimizer step when step loss > 1.5 × running EMA
+    _loss_ema: float | None = None
+    _loss_ema_alpha: float = 0.98          # ≈50-step half-life at log_interval=10
+    # LR cooldown: halve LR for 200 steps whenever val loss spikes above best × 1.15
+    _lr_cooldown_steps: int = 0
+    _lr_cooldown_scale: float = 1.0
 
     eff_batch = current_stage.batch_size * current_stage.grad_accum
     print(f"\nTraining for {args.max_steps} steps "
           f"(starting stage {current_stage.index}, "
           f"effective batch = {eff_batch} × {current_stage.seq_len} tokens)\n")
 
+    _stage_total = current_stage.end_step - max(start_step, current_stage.start_step)
     step_iter = tqdm(
         range(start_step, args.max_steps),
-        total=max(args.max_steps - start_step, 0),
+        total=_stage_total,
         desc=f"stage {current_stage.index} (seq={current_stage.seq_len})",
         dynamic_ncols=True,
     )
@@ -918,15 +1469,27 @@ def main():
             old = current_stage
             current_stage = stage
             # Rebuild data iterator for new seq_len / batch_size
-            train_iter = make_train_iter(current_stage.seq_len, current_stage.batch_size)
+            train_iter = make_train_iter(
+                current_stage.seq_len,
+                current_stage.batch_size,
+                cot_mix=current_stage.cot_mix,
+                instruction_mix=current_stage.instruction_mix,
+                preference_mix=current_stage.preference_mix,
+            )
             # Reset throughput counters
             t0 = time.perf_counter()
             tokens_seen = 0
             accum_loss = 0.0
-            accum_ponder = 0.0
-            accum_reason_steps = 0.0
 
             eff_batch = current_stage.batch_size * current_stage.grad_accum
+            data_tags = []
+            if current_stage.cot_mix > 0.0:
+                data_tags.append(f"CoT {current_stage.cot_mix*100:.0f}%")
+            if current_stage.instruction_mix > 0.0:
+                data_tags.append(f"Instruction {current_stage.instruction_mix*100:.0f}%")
+            if current_stage.preference_mix > 0.0:
+                data_tags.append(f"Preference {current_stage.preference_mix*100:.0f}%")
+            data_info = f"  data:     {' + '.join(data_tags)}\n" if data_tags else ""
             tqdm.write(
                 f"\n{'='*70}\n"
                 f"  STAGE TRANSITION: {old.index} → {current_stage.index}\n"
@@ -937,50 +1500,95 @@ def main():
                 f"  lr:       {old.max_lr:.1e} → {current_stage.max_lr:.1e}\n"
                 f"  warmup:   {current_stage.warmup_steps} steps\n"
                 f"  steps:    [{current_stage.start_step}, {current_stage.end_step})\n"
+                f"{data_info}"
                 f"{'='*70}\n"
             )
+            step_iter.reset(total=current_stage.end_step - current_stage.start_step)
             step_iter.set_description(
                 f"stage {current_stage.index} (seq={current_stage.seq_len})"
             )
 
         # LR schedule (per-stage)
         lr = get_lr(step, current_stage)
+        if _lr_cooldown_steps > 0:
+            lr *= _lr_cooldown_scale
+            _lr_cooldown_steps -= 1
         set_lr(optimizer, lr, args.vsa_lr_scale)
 
         # Gradient accumulation
+        _micro_loss_sum = 0.0
         for micro in range(current_stage.grad_accum):
             try:
                 batch = next(train_iter)
             except StopIteration:
-                train_iter = make_train_iter(current_stage.seq_len, current_stage.batch_size)
+                train_iter = make_train_iter(
+                    current_stage.seq_len,
+                    current_stage.batch_size,
+                    cot_mix=current_stage.cot_mix,
+                    instruction_mix=current_stage.instruction_mix,
+                    preference_mix=current_stage.preference_mix,
+                )
                 batch = next(train_iter)
 
             batch = batch.to(device)
+
+            # Prepend mode control token for mode-conditioned reasoning.
+            # Skip whenever CoT is present in this stage (CoT rows already include control spans).
+            if use_mode_training and current_stage.cot_mix == 0.0:
+                batch = sample_mode_tokens(
+                    batch, config.mode_token_ids,
+                    mode_mix=mode_mix, rng=mode_rng,
+                    think_token_id=think_token_id if use_think_training else None,
+                    end_think_token_id=end_think_token_id if use_think_training else None,
+                )
+
             input_ids = batch[:, :-1]
 
             with ctx:
                 out = model(input_ids, labels=input_ids)
                 loss = out["loss"] / current_stage.grad_accum
 
-            scaler.scale(loss).backward()
-            accum_loss += loss.item()
+            if use_scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            _lv = loss.item()
+            accum_loss += _lv
+            _micro_loss_sum += _lv
             tokens_seen += input_ids.numel()
-            # Track reasoning metrics
-            if "ponder_cost" in out:
-                accum_ponder += out["ponder_cost"].item() / current_stage.grad_accum
-                accum_reason_steps += out["mean_reason_steps"].item() / current_stage.grad_accum
+
+        # Loss spike detection — skip bad batches before they corrupt the model
+        if _loss_ema is not None and _micro_loss_sum > 1.5 * _loss_ema:
+            tqdm.write(
+                f"  ⚡ Loss spike at step {step+1}: {_micro_loss_sum:.4f} > "
+                f"1.5 × ema {_loss_ema:.4f} — skipping optimizer step"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            accum_loss -= _micro_loss_sum
+            continue
+        _loss_ema = _micro_loss_sum if _loss_ema is None else (
+            _loss_ema_alpha * _loss_ema + (1 - _loss_ema_alpha) * _micro_loss_sum
+        )
 
         # Gradient clipping
         if args.grad_clip > 0:
-            scaler.unscale_(optimizer)
+            if use_scaler:
+                scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         else:
             grad_norm = 0.0
         grad_norm_value = float(grad_norm)
 
-        # Branch gradient norms (after unscale, before step)
+        # VSA gradient scale — one fused foreach_mul_ after clip, before step
+        if vsa_grad_scale != 1.0:
+            vsa_grads = [p.grad for p in vsa_params if p.grad is not None]
+            if vsa_grads:
+                torch._foreach_mul_(vsa_grads, vsa_grad_scale)
+
+        # Branch gradient norms (after unscale, before step).
+        # Iterating all params + .norm(2) forces GPU sync — only do every 100 steps.
         branch_norms_str = ""
-        if args.log_branch_grad_norms and (step + 1) % args.log_interval == 0:
+        if args.log_branch_grad_norms and (step + 1) % max(args.log_interval * 10, 100) == 0:
             bnorms = compute_branch_grad_norms(model)
             def _fmt_grad(v: float) -> str:
                 if v == 0.0:
@@ -994,8 +1602,11 @@ def main():
                 f"∇ffn {_fmt_grad(bnorms['ffn'])}"
             )
 
-        scaler.step(optimizer)
-        scaler.update()
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         # ── Logging ──────────────────────────────────────────────────
@@ -1003,11 +1614,6 @@ def main():
             dt = time.perf_counter() - t0
             tok_per_sec = tokens_seen / dt
             avg_loss = accum_loss / args.log_interval
-            ponder_str = ""
-            if accum_ponder > 0:
-                avg_ponder = accum_ponder / args.log_interval
-                avg_rsteps = accum_reason_steps / args.log_interval
-                ponder_str = f" | ponder {avg_ponder:.4f}  steps {avg_rsteps:.1f}"
             step_iter.set_postfix(
                 loss=f"{avg_loss:.4f}",
                 lr=f"{lr:.2e}",
@@ -1022,11 +1628,8 @@ def main():
                 f"grad_norm {grad_norm_value:.2f} | "
                 f"{tok_per_sec:,.0f} tok/s"
                 f"{branch_norms_str}"
-                f"{ponder_str}"
             )
             accum_loss = 0.0
-            accum_ponder = 0.0
-            accum_reason_steps = 0.0
 
         # ── Eval ─────────────────────────────────────────────────────
         if (step + 1) % args.eval_interval == 0:
@@ -1040,6 +1643,13 @@ def main():
                 f"[stage {current_stage.index}, seq={current_stage.seq_len}]"
                 f"{gate_str}"
             )
+            if best_val < float("inf") and val_loss > best_val * 1.15:
+                _lr_cooldown_steps = 200
+                _lr_cooldown_scale = 0.5
+                tqdm.write(
+                    f"  ⚠  Val spike: {val_loss:.4f} > best {best_val:.4f} × 1.15"
+                    f" — LR ×0.5 for 200 steps"
+                )
             if val_loss < best_val:
                 best_val = val_loss
                 save_checkpoint(

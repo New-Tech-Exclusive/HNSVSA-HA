@@ -49,8 +49,8 @@ from nsvsa_ha.tokenizer import load_tokenizer
 # ═══════════════════════════════════════════════════════════════════════
 
 TOKENIZER_CONFIG = {
-    "tokenizer_json": "tokenizers/vsa48k_en_code/tokenizer.json",
-    "tokenizer_meta": "tokenizers/vsa48k_en_code/tokenizer_meta.json",
+    "tokenizer_json": "tokenizers/vsa65k_mix/tokenizer.json",
+    "tokenizer_meta": "tokenizers/vsa65k_mix/tokenizer_meta.json",
     "fallback_tiktoken": "cl100k_base",  # Used only if tokenizer_json missing
 }
 
@@ -77,14 +77,7 @@ CORPUS_CONFIG = [
         "name": "HuggingFaceFW/fineweb-edu",
         "text_field": "text",
         "split": "train",
-        "pct": 0.45,                       # English web text
-        "streaming": True,
-    },
-    {
-        "name": "bigcode/starcoderdata",
-        "text_field": "content",
-        "split": "train",
-        "pct": 0.20,                       # Programming code
+        "pct": 0.35,                       # High-quality educational web text
         "streaming": True,
     },
     {
@@ -92,23 +85,39 @@ CORPUS_CONFIG = [
         "config": "20231101.en",
         "text_field": "text",
         "split": "train",
-        "pct": 0.15,                       # Encyclopedia / factual
+        "pct": 0.20,                       # Encyclopedia / factual grounding
         "streaming": True,
     },
     {
-        "name": "emozilla/pg19-test",
+        "name": "allenai/c4",
+        "config": "en",
         "text_field": "text",
-        "split": "test",
-        "pct": 0.10,                       # Books / long-form
+        "split": "train",
+        "pct": 0.15,                       # Broad web diversity (cleaned)
         "streaming": True,
     },
-    # ── Reasoning data (trains the PonderNet controller) ──────────
+    {
+        "name": "bigcode/starcoderdata",
+        "text_field": "content",
+        "split": "train",
+        "pct": 0.15,                       # Programming/code robustness
+        "streaming": True,
+    },
+    # ── Instruction-quality conversational data ─────────────────────
+    {
+        "name": "databricks/databricks-dolly-15k",
+        "text_field": ["instruction", "context", "response"],
+        "split": "train",
+        "pct": 0.10,                       # Instruction following behavior
+        "streaming": True,
+    },
+    # ── Compact high-quality math/reasoning supervision ────────────
     {
         "name": "openai/gsm8k",
         "config": "main",
         "text_field": ["question", "answer"],
         "split": "train",
-        "pct": 0.10,                       # Math reasoning (Q+A)
+        "pct": 0.05,                       # Reasoning depth signal
         "streaming": True,
     },
 ]

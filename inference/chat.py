@@ -31,8 +31,8 @@ from nsvsa_ha import HybridNSVSA, HybridNSVSAConfig
 from nsvsa_ha.tokenizer import BaseTokenizer, load_tokenizer, tokenizer_compatible
 
 
-DEFAULT_CUSTOM_TOKENIZER_JSON = "tokenizers/vsa48k_en_code/tokenizer.json"
-DEFAULT_CUSTOM_TOKENIZER_META = "tokenizers/vsa48k_en_code/tokenizer_meta.json"
+DEFAULT_CUSTOM_TOKENIZER_JSON = "tokenizers/vsa65k_mix/tokenizer.json"
+DEFAULT_CUSTOM_TOKENIZER_META = "tokenizers/vsa65k_mix/tokenizer_meta.json"
 
 
 # ─── Load ────────────────────────────────────────────────────────────────────

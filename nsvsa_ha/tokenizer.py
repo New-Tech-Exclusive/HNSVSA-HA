@@ -124,6 +124,25 @@ class HFJsonTokenizer(BaseTokenizer):
 
         self._eot_id = int(eot_id)
 
+        # Mode control token IDs (optional, loaded from metadata)
+        self._fast_token_id: Optional[int] = self._meta.get("fast_token_id")
+        self._reason_token_id: Optional[int] = self._meta.get("reason_token_id")
+        self._deep_token_id: Optional[int] = self._meta.get("deep_token_id")
+        if self._fast_token_id is not None:
+            self._fast_token_id = int(self._fast_token_id)
+        if self._reason_token_id is not None:
+            self._reason_token_id = int(self._reason_token_id)
+        if self._deep_token_id is not None:
+            self._deep_token_id = int(self._deep_token_id)
+
+        # Think/end-think token IDs (optional, loaded from metadata)
+        self._think_token_id: Optional[int] = self._meta.get("think_token_id")
+        self._end_think_token_id: Optional[int] = self._meta.get("end_think_token_id")
+        if self._think_token_id is not None:
+            self._think_token_id = int(self._think_token_id)
+        if self._end_think_token_id is not None:
+            self._end_think_token_id = int(self._end_think_token_id)
+
     def encode(self, text: str) -> list[int]:
         return self._tok.encode(text).ids
 
@@ -144,6 +163,38 @@ class HFJsonTokenizer(BaseTokenizer):
     @property
     def eot_token_text(self) -> str:
         return self._eot_text
+
+    @property
+    def fast_token_id(self) -> Optional[int]:
+        return self._fast_token_id
+
+    @property
+    def reason_token_id(self) -> Optional[int]:
+        return self._reason_token_id
+
+    @property
+    def deep_token_id(self) -> Optional[int]:
+        return self._deep_token_id
+
+    @property
+    def think_token_id(self) -> Optional[int]:
+        return self._think_token_id
+
+    @property
+    def end_think_token_id(self) -> Optional[int]:
+        return self._end_think_token_id
+
+    def mode_token_ids(self) -> Dict[int, int]:
+        """Return {mode_id: token_id} dict for available mode control tokens."""
+        from .modes import MODE_FAST, MODE_REASON, MODE_DEEP
+        out: Dict[int, int] = {}
+        if self._fast_token_id is not None:
+            out[MODE_FAST] = self._fast_token_id
+        if self._reason_token_id is not None:
+            out[MODE_REASON] = self._reason_token_id
+        if self._deep_token_id is not None:
+            out[MODE_DEEP] = self._deep_token_id
+        return out
 
     def info(self) -> Dict[str, Any]:
         return TokenizerInfo(
@@ -182,12 +233,14 @@ def tokenizer_compatible(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """
     Compatibility check for checkpoint vs runtime tokenizer.
 
-    We require vocab size and EOT ID to match exactly.
+    Requires the EOT token IDs to match.  Vocab-size growth (runtime >
+    checkpoint) is allowed — the extra rows are new special tokens that are
+    handled by ``_expand_vocab_in_state`` in the training script.
     Name/backend mismatches are warnings, not fatal, if IDs and size match.
     """
     if not a or not b:
         return True
-    return (
-        int(a.get("vocab_size", -1)) == int(b.get("vocab_size", -2))
-        and int(a.get("eot_token_id", -1)) == int(b.get("eot_token_id", -2))
-    )
+    eot_ok = int(a.get("eot_token_id", -1)) == int(b.get("eot_token_id", -2))
+    # Allow runtime vocab to be larger than checkpoint vocab (new special tokens)
+    vocab_ok = int(b.get("vocab_size", -1)) >= int(a.get("vocab_size", -2))
+    return eot_ok and vocab_ok
