@@ -108,9 +108,13 @@ class HybridNSVSALayer(nn.Module):
         self.norm_vsa  = RMSNorm(d_model, eps=layer_norm_eps)
         self.norm_ffn  = RMSNorm(d_model, eps=layer_norm_eps)
 
-        # Learnable mixing gate: how much VSA contributes to residual stream
-        # sigmoid(gate_init_bias) controls the starting contribution
-        self.vsa_gate = nn.Parameter(torch.full((d_model,), gate_init_bias))
+        # Input-dependent mixing gate: how much VSA contributes per token.
+        # At init, weight=0 and bias=gate_init_bias, so the gate starts as
+        # a static sigmoid(bias) ≈ 0.12 (for bias=-2); during training each
+        # token learns to modulate how much long-range VSA context it uses.
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.gate_proj.weight)
+        self.gate_proj.bias.data.fill_(gate_init_bias)
 
     def forward(
         self,
@@ -144,18 +148,20 @@ class HybridNSVSALayer(nn.Module):
         x = x + attn_out
 
         # ── 2. Soft VSA state update ─────────────────────────────────
-        # Input is the current x (post-attention), L2-normalized per token
+        # Input is the current x (post-attention), RMSNorm'd only (no L2
+        # normalization — magnitude information from the residual stream is
+        # preserved for richer group bundling).
         x_norm = self.norm_vsa(x)
-        x_unit = F.normalize(x_norm, p=2, dim=-1)  # keep on hypersphere
 
         vsa_cache = layer_cache.vsa if layer_cache is not None else None
         vsa_queries, vsa_state, new_vsa_cache = self.soft_vsa(
-            x_unit, local_positions, macro_positions,
+            x_norm, local_positions, macro_positions,
             vsa_cache=vsa_cache, use_cache=use_cache,
         )  # [B, L, d], [B, d], Optional[VSACache]
 
-        # Gate controls VSA contribution: starts near-zero, learns to open
-        gate = torch.sigmoid(self.vsa_gate)  # [d]
+        # Input-dependent gate: each token decides per-dimension how much
+        # long-range VSA context to incorporate.
+        gate = torch.sigmoid(self.gate_proj(x_norm))  # [B, L, d]
         vsa_contrib = gate * self.vsa_out_proj(vsa_queries)
         x = x + vsa_contrib
 

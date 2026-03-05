@@ -57,6 +57,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 model: HybridNSVSA | None = None
 tokenizer: BaseTokenizer | None = None
 device: torch.device | None = None
+loaded_checkpoint: str = ""
 gen_lock = asyncio.Lock()  # Serialize generation (1 GPU)
 
 
@@ -101,6 +102,7 @@ class ModelInfo(BaseModel):
     vocab_size: int
     device: str
     tokenizer: str
+    checkpoint: str
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -129,6 +131,7 @@ async def info():
         vocab_size=cfg.vocab_size,
         device=str(device),
         tokenizer=f"{tok_info['backend']}:{tok_info['name']}",
+        checkpoint=loaded_checkpoint,
     )
 
 
@@ -382,6 +385,16 @@ def parse_args():
     p = argparse.ArgumentParser(description="Arnold web chat server")
 
     p.add_argument("--checkpoint", default="checkpoints/best.pt")
+    p.add_argument(
+        "--checkpoint_kind",
+        choices=["best", "final"],
+        default=None,
+        help=(
+            "Shortcut for SFT checkpoints in checkpoints/sft: "
+            "best -> checkpoints/sft/best_sft.pt, "
+            "final -> checkpoints/sft/sft_final.pt"
+        ),
+    )
     p.add_argument("--no_checkpoint", action="store_true")
 
     # Model config (only with --no_checkpoint)
@@ -406,7 +419,7 @@ def parse_args():
 
 
 def main():
-    global model, tokenizer, device
+    global model, tokenizer, device, loaded_checkpoint
 
     args = parse_args()
 
@@ -431,6 +444,14 @@ def main():
 
     if args.no_checkpoint:
         args.vocab_size = tokenizer.n_vocab
+    elif args.checkpoint_kind is not None:
+        ckpt_map = {
+            "best": "checkpoints/sft/best_sft.pt",
+            "final": "checkpoints/sft/sft_final.pt",
+        }
+        args.checkpoint = ckpt_map[args.checkpoint_kind]
+
+    loaded_checkpoint = args.checkpoint if not args.no_checkpoint else "<random-init>"
 
     model, device = load_model_from_args(args, tok_info)
 

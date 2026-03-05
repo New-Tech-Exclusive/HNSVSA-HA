@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Arnold Chat — Streaming SSE chat logic
+   Arnold Chat — Claude layout · Gemini colors
    ═══════════════════════════════════════════════════════════════════ */
 
 const messagesEl    = document.getElementById('messages');
@@ -9,9 +9,18 @@ const inputEl       = document.getElementById('input');
 const sendBtn       = document.getElementById('send-btn');
 const settingsEl    = document.getElementById('settings-overlay');
 const modelInfoEl   = document.getElementById('model-info');
+const sidebarEl     = document.getElementById('sidebar');
+const sidebarHistory = document.getElementById('sidebar-history');
 
 let isGenerating = false;
 let abortController = null;
+let chatTitle = null;  // title of the current active chat
+
+// ── Sidebar ──────────────────────────────────────────────────────
+
+function toggleSidebar() {
+  sidebarEl.classList.toggle('collapsed');
+}
 
 // ── Load model info ──────────────────────────────────────────────
 
@@ -20,9 +29,9 @@ async function loadModelInfo() {
     const res = await fetch('/api/info');
     const info = await res.json();
     const params = (info.parameters / 1e6).toFixed(0);
-    modelInfoEl.textContent = `${params}M params · d=${info.d_model} · L=${info.num_layers} · ${info.device}`;
+    modelInfoEl.textContent = `Arnold ${params}M · d=${info.d_model} · L=${info.num_layers} · ${info.device}`;
   } catch {
-    modelInfoEl.textContent = 'Model loaded';
+    modelInfoEl.textContent = 'Arnold · model loaded';
   }
 }
 loadModelInfo();
@@ -140,6 +149,15 @@ function getParams() {
 // ── Clear chat ──────────────────────────────────────────────────
 
 function clearChat() {
+  // Archive current conversation title to sidebar history
+  if (chatTitle && messagesInner.children.length > 0) {
+    const item = document.createElement('div');
+    item.className = 'history-item';
+    item.textContent = chatTitle;
+    item.title = chatTitle;
+    sidebarHistory.prepend(item);
+  }
+  chatTitle = null;
   messagesInner.innerHTML = '';
   welcomeEl.style.display = '';
 }
@@ -147,7 +165,8 @@ function clearChat() {
 // ── Suggestion click ────────────────────────────────────────────
 
 function sendSuggestion(el) {
-  inputEl.value = el.textContent;
+  const span = el.querySelector('span');
+  inputEl.value = span ? span.textContent : el.textContent;
   sendMessage();
 }
 
@@ -169,6 +188,9 @@ async function sendMessage() {
   // Reset input
   inputEl.value = '';
   inputEl.style.height = 'auto';
+
+  // Set chat title from first message
+  if (!chatTitle) chatTitle = text.slice(0, 60) + (text.length > 60 ? '…' : '');
 
   // Add user message
   addMessage('user', escapeHtml(text));

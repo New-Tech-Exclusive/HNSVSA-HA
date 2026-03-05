@@ -111,10 +111,36 @@ class SoftVSAStateUpdate(nn.Module):
         # Projection to mix local-attention output into VSA state query
         self.query_proj = nn.Linear(d, d, bias=False)
 
+        # Content-dependent decay modulation (input-selective forgetting).
+        # Zero-init so the model starts with the static decay and gradually
+        # learns to condition the forgetting rate on what it's reading.
+        self.decay_proj = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.decay_proj.weight)
+
     @property
     def decay(self) -> torch.Tensor:
-        """Per-dimension decay coefficients α ∈ (0, 1)."""
-        return torch.sigmoid(self.decay_logit)
+        """Static per-dimension decay coefficients α ∈ (0.05, 0.99).
+
+        Used as the base decay when no content is available (e.g. initial
+        state).  See compute_decay() for the content-dependent version.
+        """
+        return torch.sigmoid(self.decay_logit).clamp(0.05, 0.99)
+
+    def compute_decay(self, x: torch.Tensor) -> torch.Tensor:
+        """Content-dependent decay: α = σ(base_logit + proj(x)).
+
+        Each group vector modulates the per-dimension forgetting rate,
+        allowing the model to selectively retain or overwrite parts of
+        the global state based on content.  At initialization decay_proj
+        is zero so this returns the static decay; the modulation is
+        learned end-to-end during training.
+
+        Args:
+            x: Group vector [B, d] or [B, G, d].
+        Returns:
+            Per-dimension decay ∈ (0.05, 0.99), same shape as x.
+        """
+        return torch.sigmoid(self.decay_logit + self.decay_proj(x)).clamp(0.05, 0.99)
 
     # ------------------------------------------------------------------
     # Core algebraic primitives (continuous, real gradients throughout)
@@ -175,20 +201,20 @@ class SoftVSAStateUpdate(nn.Module):
         macro_positions: torch.Tensor,  # [n_groups, d]
     ) -> torch.Tensor:                  # [B, n_groups, d]
         """
-        Causal EMA over bound group vectors.
+        Causal EMA over bound group vectors with content-dependent decay.
 
-        S_j = α ⊙ S_{j-1}  +  (1-α) ⊙ normalize(G_j ⊙ P_j)
-        then re-normalize so ||S_j||₂ = 1.
+        S_j = α_j ⊙ S_{j-1}  +  (1-α_j) ⊙ (G_j ⊙ P_j)
+        where α_j = σ(base_logit + proj(G_j)) adapts the forgetting
+        rate to each group's content.  Re-normalize so ||S_j||₂ = 1.
         """
         B, n_groups, d = group_vectors.shape
-        α = self.decay                                     # [d]
         states = []
 
         S = torch.zeros(B, d, device=group_vectors.device)
 
         for j in range(n_groups):
             bound_g = self.bind(group_vectors[:, j], macro_positions[j])  # [B, d]
-            # EMA update
+            α = self.compute_decay(group_vectors[:, j])                   # [B, d]
             S = α * S + (1.0 - α) * bound_g
             S = F.normalize(S, p=2, dim=-1, eps=self.eps)
             states.append(S)
@@ -210,7 +236,7 @@ class SoftVSAStateUpdate(nn.Module):
 
     def _forward_step(
         self,
-        token_vec: torch.Tensor,        # [B, d]  L2-normalized
+        token_vec: torch.Tensor,        # [B, d]  (RMSNorm'd)
         local_positions: torch.Tensor,  # [K, d]
         macro_positions: torch.Tensor,  # [max_groups, d]
         cache: VSACache,
@@ -251,7 +277,7 @@ class SoftVSAStateUpdate(nn.Module):
                 group_vec, macro_positions[safe_n]
             )
             # EMA update of global state
-            α = self.decay                                  # [d]
+            α = self.compute_decay(group_vec)               # [B, d]
             new_state = α * cache.global_state + (1.0 - α) * bound_group
             new_state = F.normalize(new_state, p=2, dim=-1, eps=self.eps)
             # Reset group accumulator

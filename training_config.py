@@ -26,7 +26,7 @@ DEFAULT_TRAINING_CONFIG = {
     "window_size": 256,  # Local attention context window in tokens.
     "group_size": 64,  # Tokens per VSA group update (global memory stride).
     "ffn_ratio": 4.0,  # FFN expansion multiplier (controls MLP capacity).
-    "dropout": 0.08,  # Regularization to prevent overfitting on cycled data.
+    "dropout": 0.05,  # Regularization; 0.05 balances underfitting and overfitting on cycled data.
     "max_seq_len": 2048,  # Maximum sequence length the model can handle.
     "vocab_size": 0,  # 0 = auto-match tokenizer vocab size.
 
@@ -43,11 +43,16 @@ DEFAULT_TRAINING_CONFIG = {
     "warmup_steps": 3000,  # Linear warmup duration before cosine decay (stage 1 or flat).
     "weight_decay": 0.1,  # L2-style regularization strength on decay parameter groups.
     "vsa_lr_scale": 0.3,  # Multiplier for VSA parameter-group LR vs base LR.
-    "vsa_grad_scale": 30.0,  # Gradient multiplier for VSA params (counteracts EMA attenuation).
-    "gate_init_bias": -2.0,  # Initial vsa_gate bias; sigmoid(-2)≈0.12, VSA starts quiet.
+    "vsa_grad_scale": 5.0,   # Gradient multiplier for VSA params. 5× keeps ∇vsa within ~2× of
+                             # ∇attn; 30× was too aggressive and risked destabilizing the residual.
+    "gate_init_bias": -2.0,  # Initial gate_proj bias; sigmoid(-2)≈0.12, VSA starts quiet.
+    "vsa_gate_warmup": 2000, # Freeze gate_proj for this many steps so attention builds a stable
+                             # basis before VSA starts contributing. 0 = no freeze.
+    "vsa_decay_reg": 0.01,   # Penalize per-dim decay values approaching 1.0 (frozen-state collapse).
+                             # Soft penalty: coefficient × mean(clamp(decay - 0.85, min=0)).
     "grad_clip": 0.5,  # Global gradient norm clip threshold.
     "beta1": 0.9,  # AdamW beta1 (momentum of first moment estimate).
-    "beta2": 0.90,  # AdamW beta2 (second-moment smoothing; 0.90 adapts faster than 0.999).
+    "beta2": 0.95,  # AdamW beta2 (0.95 is a good middle ground; 0.90 made second moments too noisy).
 
     # Thinking-mode control
     # Mode tokens (<|fast|>/<|reason|>/<|deep|>) control thinking depth:
@@ -99,20 +104,23 @@ DEFAULT_TRAINING_CONFIG = {
             "intra_warmup": 500,
         },
         # Stage 3 (32,768 steps): think-token supervision.
-        # Teaches the model when and
-        # how to use <|think|> ... <|/think|> spans.  Pure CoT data, low LR.
-        # sample_mode_tokens() is skipped for this stage; mode tokens are baked in.
+        # Teaches the model when/how to use <|think|>…<|/think|> spans.
+        # 70% CoT + 30% base data preserves language-modeling grounding and
+        # prevents memorization of a small CoT file.
+        # Mode tokens are baked into CoT rows — skip sample_mode_tokens().
         {
             "seq_len": 512,
             "pct": 0.20,   # 32,768 / 163,840
             "batch_size": 4,
             "grad_accum": 8,
-            "max_lr": 5e-5,   # fine-tuning LR — gentle, don't overwrite pretraining
-            "min_lr": 5e-6,
-            "intra_warmup": 200,
-            "cot_mix": 1.0,   # 100 % CoT data — every batch is think-supervised
+            "max_lr": 8e-5,   # was 5e-5; 3× jump with only 200 warmup was too sharp
+            "min_lr": 8e-6,
+            "intra_warmup": 750,  # was 200; avoids gradient-scale shock at stage entry
+            "cot_mix": 0.70,  # was 1.0; 30% base data retains language-model grounding
+            "skip_mode_tokens": True,  # CoT rows already have mode/think spans baked in
         },
-        # Stage 4 (32,768 steps): alignment phase (instruction tuning + RLHF-style preference SFT).
+        # Stage 4 (32,768 steps): alignment phase (instruction + RLHF-style preference SFT).
+        # Instruction/preference data has its own formatting — don't prepend mode tokens.
         {
             "seq_len": 512,
             "pct": 0.20,  # 32,768 / 163,840
@@ -120,9 +128,10 @@ DEFAULT_TRAINING_CONFIG = {
             "grad_accum": 8,
             "max_lr": 3e-5,
             "min_lr": 3e-6,
-            "intra_warmup": 200,
+            "intra_warmup": 500,  # was 200; gentler entry into alignment stage
             "instruction_mix": 0.7,
             "preference_mix": 0.3,
+            "skip_mode_tokens": True,  # instruction/preference data doesn't expect leading mode token
         },
     ],
 
@@ -143,7 +152,9 @@ DEFAULT_TRAINING_CONFIG = {
     "entropy_reg": 0.0,    # Entropy bonus: prevents vocabulary collapse (subtracts α·H(p) from loss).
                            # WARNING: log_softmax over full vocab on every micro-step is expensive.
                            # Typical useful range: 0.005–0.02. Default off.
-    "embed_reg": 0.005,      # Embedding RMS norm regularization. Typical: 1e-4. Default off.
+    "embed_reg": 0.0,      # Embedding RMS norm regularization. Typical: 1e-4. Default off.
+    "z_loss": 1e-4,        # Z-loss: penalizes log(Z)² to prevent logit explosion (PaLM/Gemma style).
+    "gate_entropy_loss": 0.001,  # Gate entropy loss: prevents VSA gates from saturating at 0 or 1.
 
     # EMA model weights (opt-in — set > 0.0 to enable)
     "ema_decay": 0.9999,          # EMA decay rate; 0 = disable. 0.9999 ≈ 10k-step half-life.

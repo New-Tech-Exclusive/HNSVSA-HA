@@ -9,8 +9,8 @@ Design decisions:
     grammatical dependencies.
   - Causal masking: no information leaks from future tokens.
   - RoPE applied to Q and K: relative-position aware, length-generalizing.
-  - Uses torch.nn.functional.scaled_dot_product_attention (FlashAttention
-    kernel when available) for memory and speed efficiency.
+  - Uses FlashAttention-2 via torch SDPA with is_causal=True when possible.
+    Falls back to a Triton fused sliding-window kernel, then to masked SDPA.
 
 Griffin insight (De et al. 2024): combining a local attention window with a
 recurrent compressed state (here: soft VSA) matches or exceeds pure attention
@@ -26,6 +26,104 @@ from typing import Optional, Tuple
 from .rope import RotaryEmbedding
 from .cache import AttentionCache
 
+# --------------------------------------------------------------------------
+# Triton fused sliding-window causal attention kernel
+# --------------------------------------------------------------------------
+_HAS_TRITON = False
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    pass
+
+if _HAS_TRITON:
+    @triton.jit
+    def _fwd_sliding_window_kernel(
+        Q, K, V, Out,
+        stride_qb, stride_qh, stride_qm, stride_qk,
+        stride_kb, stride_kh, stride_kn, stride_kk,
+        stride_vb, stride_vh, stride_vn, stride_vk,
+        stride_ob, stride_oh, stride_om, stride_ok,
+        seq_len,
+        window_size: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sm_scale,
+    ):
+        """Fused sliding-window causal attention forward kernel.
+
+        Each program instance computes a BLOCK_M×HEAD_DIM tile of the output.
+        K/V are iterated in BLOCK_N chunks, masked for causal + window.
+        """
+        pid_m = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        batch = pid_bh // stride_qh  # not used directly; strides encode layout
+        # Ignore batch/head decomposition — we rely on strides for indexing.
+
+        m_start = pid_m * BLOCK_M
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, HEAD_DIM)
+
+        # Pointers into Q for this block
+        q_ptrs = Q + pid_bh * stride_qh + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+        o_ptrs = Out + pid_bh * stride_oh + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+
+        # Load Q tile  [BLOCK_M, HEAD_DIM]
+        q = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len), other=0.0)
+
+        # Online softmax accumulators
+        m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        # Determine K/V iteration range for this Q block
+        # Causal: can only attend to columns <= max(offs_m)
+        # Window: can only attend to columns >= min(offs_m) - window_size + 1
+        col_end = min((m_start + BLOCK_M), seq_len)
+        col_start = max(0, m_start - window_size + 1)
+        # Align col_start down to BLOCK_N boundary
+        col_start = (col_start // BLOCK_N) * BLOCK_N
+
+        for n_start in range(col_start, col_end, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            # Load K/V tiles
+            k_ptrs = K + pid_bh * stride_kh + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
+            v_ptrs = V + pid_bh * stride_vh + offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk
+
+            k = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len), other=0.0)
+            v = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len), other=0.0)
+
+            # QK^T  [BLOCK_M, BLOCK_N]
+            qk = tl.dot(q, k) * sm_scale
+
+            # Causal mask: row >= col
+            causal_mask = offs_m[:, None] >= offs_n[None, :]
+            # Window mask: row - col < window_size
+            window_mask = (offs_m[:, None] - offs_n[None, :]) < window_size
+            # Validity mask (don't read past seq_len)
+            valid_mask = offs_n[None, :] < seq_len
+
+            mask = causal_mask & window_mask & valid_mask
+            qk = tl.where(mask, qk, float("-inf"))
+
+            # Online softmax update
+            m_ij = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            beta = tl.exp(m_ij - m_new)
+
+            l_i = l_i * alpha + tl.sum(tl.exp(qk - m_new[:, None]), axis=1)
+            acc = acc * alpha[:, None] + tl.dot(tl.exp(qk - m_new[:, None]).to(v.dtype), v)
+            m_i = m_new
+
+        # Final normalization
+        acc = acc / l_i[:, None]
+
+        # Store output
+        tl.store(o_ptrs, acc.to(q.dtype), mask=(offs_m[:, None] < seq_len))
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand KV heads to match Q heads for Grouped Query Attention.
@@ -38,6 +136,43 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     B, Hkv, L, D = x.shape
     x = x[:, :, None, :, :].expand(B, Hkv, n_rep, L, D)
     return x.reshape(B, Hkv * n_rep, L, D)
+
+
+def _triton_sliding_window_attention(
+    q: torch.Tensor,   # [B, H, L, D]
+    k: torch.Tensor,   # [B, H, L, D]
+    v: torch.Tensor,   # [B, H, L, D]
+    window_size: int,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Launch the Triton fused sliding-window causal attention kernel."""
+    B, H, L, D = q.shape
+    out = torch.empty_like(q)
+
+    # Block sizes — tuned for SM 8.x (RTX 30xx / A100)
+    BLOCK_M = 64
+    BLOCK_N = 64
+
+    grid = (
+        (L + BLOCK_M - 1) // BLOCK_M,  # tiles over sequence
+        B * H,                           # one program per (batch, head)
+    )
+
+    _fwd_sliding_window_kernel[grid](
+        q, k, v, out,
+        q.stride(0) * q.stride(1),  # stride_qb  (unused — folded into pid_bh)
+        q.stride(1), q.stride(2), q.stride(3),
+        k.stride(1), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(1), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(1), out.stride(1), out.stride(2), out.stride(3),
+        seq_len=L,
+        window_size=window_size,
+        HEAD_DIM=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        sm_scale=sm_scale,
+    )
+    return out
 
 
 class LocalWindowedAttention(nn.Module):
@@ -131,6 +266,10 @@ class LocalWindowedAttention(nn.Module):
         if key in self._attn_mask_cache:
             return self._attn_mask_cache[key]
 
+        # Evict oldest entry when cache exceeds 8 entries (curriculum varies seq_len)
+        if len(self._attn_mask_cache) >= 8:
+            self._attn_mask_cache.pop(next(iter(self._attn_mask_cache)))
+
         row_idx = torch.arange(seq_len, device=device).unsqueeze(1)
         col_idx = torch.arange(seq_len, device=device).unsqueeze(0)
 
@@ -153,7 +292,6 @@ class LocalWindowedAttention(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    @torch._dynamo.disable
     def forward(
         self,
         x: torch.Tensor,                          # [B, L, d_model]
@@ -165,6 +303,13 @@ class LocalWindowedAttention(nn.Module):
         Returns:
             output:    [B, L, d_model]
             new_cache: AttentionCache if use_cache else None
+
+        Kernel selection (training / prefill):
+          1. If seq_len <= window_size: pure causal SDPA with is_causal=True
+             → routes to FlashAttention-2 (no explicit mask tensor needed).
+          2. Else if Triton is available: fused sliding-window Triton kernel
+             with causal + window masking in one pass — no mask allocation.
+          3. Fallback: additive mask SDPA (math kernel).
         """
         B, L, _ = x.shape
         H = self.num_heads
@@ -229,25 +374,58 @@ class LocalWindowedAttention(nn.Module):
                 q = F.normalize(q, p=2, dim=-1) * self.qk_temperature
                 k_attn = F.normalize(k_attn, p=2, dim=-1)
 
-            attn_mask = self._get_causal_window_mask(L, x.device)
             sdpa_scale = 1.0 if self.qk_norm else None
+            dropout_p = self.attn_dropout.p if self.training else 0.0
 
-            try:
+            if L <= self.window_size:
+                # ── Path 1: Full causal — FlashAttention via is_causal ──
+                # No window restriction needed when the entire sequence fits
+                # within the window.  is_causal=True avoids allocating a mask
+                # tensor, enabling the Flash SDP kernel (2-4× faster, O(1) mem).
                 out = F.scaled_dot_product_attention(
                     q, k_attn, v_attn,
-                    attn_mask=attn_mask,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    dropout_p=dropout_p,
+                    is_causal=True,
                     scale=sdpa_scale,
                 )
-            except Exception:
-                # Fallback for older PyTorch
-                if self.qk_norm:
-                    scores = torch.matmul(q, k_attn.transpose(-2, -1)) + attn_mask
-                else:
-                    scores = torch.matmul(q, k_attn.transpose(-2, -1)) / self.scale + attn_mask
-                attn_weights = F.softmax(scores, dim=-1)
-                attn_weights = self.attn_dropout(attn_weights)
-                out = torch.matmul(attn_weights, v_attn)
+            elif (
+                _HAS_TRITON
+                and q.is_cuda
+                and not torch.is_grad_enabled()   # forward-only kernel; use during inference
+                and not self.qk_norm
+                and dropout_p == 0.0
+            ):
+                # ── Path 2: Triton fused sliding-window kernel ──────────
+                # Handles causal + window masking in a single fused kernel
+                # with online softmax — no mask allocation, O(W·L) compute.
+                # Only used during inference (no autograd backward).
+                sm_scale = 1.0 / math.sqrt(Dh)
+                out = _triton_sliding_window_attention(
+                    q, k_attn, v_attn,
+                    window_size=self.window_size,
+                    sm_scale=sm_scale,
+                )
+            else:
+                # ── Path 3: Fallback — additive mask SDPA ───────────────
+                attn_mask = self._get_causal_window_mask(L, x.device)
+                # Cast mask to match Q dtype (bf16/fp16 under DeepSpeed/AMP)
+                attn_mask = attn_mask.to(q.dtype)
+                try:
+                    out = F.scaled_dot_product_attention(
+                        q, k_attn, v_attn,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                        scale=sdpa_scale,
+                    )
+                except Exception:
+                    # Fallback for older PyTorch
+                    if self.qk_norm:
+                        scores = torch.matmul(q, k_attn.transpose(-2, -1)) + attn_mask
+                    else:
+                        scores = torch.matmul(q, k_attn.transpose(-2, -1)) / self.scale + attn_mask
+                    attn_weights = F.softmax(scores, dim=-1)
+                    attn_weights = self.attn_dropout(attn_weights)
+                    out = torch.matmul(attn_weights, v_attn)
 
         # Reshape and project output
         out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)

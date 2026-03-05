@@ -202,6 +202,16 @@ def parse_args():
     # Model loading
     p.add_argument("--checkpoint",  default="checkpoints/best.pt",
                    help="Path to .pt checkpoint")
+    p.add_argument(
+        "--checkpoint_kind",
+        choices=["best", "final"],
+        default=None,
+        help=(
+            "Shortcut for SFT checkpoints in checkpoints/sft: "
+            "best -> checkpoints/sft/best_sft.pt, "
+            "final -> checkpoints/sft/sft_final.pt"
+        ),
+    )
     p.add_argument("--no_checkpoint", action="store_true",
                    help="Skip loading checkpoint (random weights)")
 
@@ -238,6 +248,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if not args.no_checkpoint and args.checkpoint_kind is not None:
+        ckpt_map = {
+            "best": "checkpoints/sft/best_sft.pt",
+            "final": "checkpoints/sft/sft_final.pt",
+        }
+        args.checkpoint = ckpt_map[args.checkpoint_kind]
 
     if args.tokenizer_json and not os.path.exists(args.tokenizer_json):
         print(

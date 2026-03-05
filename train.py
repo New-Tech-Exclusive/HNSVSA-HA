@@ -88,6 +88,8 @@ class CurriculumStage:
     cot_mix: float = 0.0  # fraction of batches from CoT dataset (0=none, 1=all CoT)
     instruction_mix: float = 0.0  # fraction from instruction SFT dataset
     preference_mix: float = 0.0  # fraction from preference-chosen dataset (RLHF-style SFT)
+    skip_mode_tokens: bool = False  # skip sample_mode_tokens() injection for this stage
+                                    # (CoT/instruction data has its own formatting)
 
 
 def build_curriculum(args) -> list[CurriculumStage]:
@@ -114,6 +116,7 @@ def build_curriculum(args) -> list[CurriculumStage]:
             cot_mix=float(cfg.get("cot_mix", 0.0)),
             instruction_mix=float(cfg.get("instruction_mix", 0.0)),
             preference_mix=float(cfg.get("preference_mix", 0.0)),
+            skip_mode_tokens=bool(cfg.get("skip_mode_tokens", False)),
         ))
         cursor += n_steps
     return stages
@@ -535,15 +538,22 @@ def get_lr(step: int, stage: CurriculumStage) -> float:
     """
     Per-stage linear warmup → cosine decay.
 
-    Each stage has its own warmup and cosine decay schedule relative to its
-    own start/end bounds.
+    Stage 0 warms up from near-zero (optimizer cold start).
+    Stages 1+ start at 10% of max_lr so there is no abrupt gradient-scale
+    shock when the learning rate resets at a stage boundary while the
+    optimizer's second-moment statistics are already well-formed.
     """
     local_step = step - stage.start_step
     stage_len = stage.end_step - stage.start_step
 
+    # Warmup base: stage 0 from ~0; later stages from 10% so the entry
+    # LR jump isn't jarring against an already-converged optimizer state.
+    warmup_base = 0.0 if stage.index == 0 else 0.1 * stage.max_lr
+
     # Warmup phase
     if local_step < stage.warmup_steps:
-        return stage.max_lr * (local_step + 1) / stage.warmup_steps
+        t = (local_step + 1) / stage.warmup_steps
+        return warmup_base + (stage.max_lr - warmup_base) * t
 
     # Past end (shouldn't happen but be safe)
     if local_step >= stage_len:
@@ -575,7 +585,7 @@ def make_param_groups(
     3-way split:
       1. VSA params (decay + query_proj): low LR, with weight decay
       2. Other ≥2-D params (Linear weights, Embedding): base LR, with weight decay
-      3. 1-D params (biases, LayerNorm, vsa_gate): base LR, NO weight decay
+      3. 1-D params (biases, LayerNorm, gate_proj bias): base LR, NO weight decay
 
     This avoids decaying norms/biases (hurts training) and keeps VSA
     parameters on a gentler learning trajectory.
@@ -610,9 +620,40 @@ def log_gate_values(model: HybridNSVSA) -> str:
     parts = []
     layers = model.layers.layers  # nn.ModuleList of HybridNSVSALayer
     for i, layer in enumerate(layers):
-        gate_mean = torch.sigmoid(layer.vsa_gate).mean().item()
+        gate_mean = torch.sigmoid(layer.gate_proj.bias.float()).mean().item()
         parts.append(f"L{i}={gate_mean:.3f}")
     return "  gates: " + "  ".join(parts)
+
+
+def log_vsa_state_health(model: HybridNSVSA) -> str:
+    """
+    Diagnostic: check VSA per-dimension decay statistics for collapse signs.
+
+    Danger signals:
+      decay_mean > 0.98  → state barely updates (frozen at initialization)
+      decay_std  < 0.001 → all dimensions behaving identically (collapsed diversity)
+
+    Returns a compact multi-layer string suitable for tqdm.write().
+    """
+    parts = []
+    layers = model.layers.layers
+    danger = False
+    for i, layer in enumerate(layers):
+        decay = torch.sigmoid(layer.soft_vsa.decay_logit.detach().float())
+        μ = decay.mean().item()
+        σ = decay.std().item()
+        flag = ""
+        if μ > 0.98:
+            flag = "⚠FROZEN"
+            danger = True
+        elif σ < 0.001:
+            flag = "⚠UNIFORM"
+            danger = True
+        parts.append(f"L{i}:μ={μ:.3f},σ={σ:.4f}{flag}")
+    prefix = "  vsa_decay: "
+    if danger:
+        prefix = "  ⚠ vsa_decay: "
+    return prefix + "  ".join(parts)
 
 
 def compute_branch_grad_norms(model: HybridNSVSA) -> dict[str, float]:
@@ -624,7 +665,7 @@ def compute_branch_grad_norms(model: HybridNSVSA) -> dict[str, float]:
         g2 = p.grad.data.norm(2).item() ** 2
         if "local_attn" in name:
             attn_sq += g2
-        elif "soft_vsa" in name or "vsa_gate" in name or "vsa_out_proj" in name or "norm_vsa" in name:
+        elif "soft_vsa" in name or "gate_proj" in name or "vsa_out_proj" in name or "norm_vsa" in name:
             vsa_sq += g2
         elif "ffn" in name:
             ffn_sq += g2
@@ -997,7 +1038,7 @@ def parse_args():
     p.add_argument("--vsa_grad_scale", type=float, default=1.0,
                    help="Gradient multiplier for VSA params (counteracts EMA attenuation)")
     p.add_argument("--gate_init_bias", type=float, default=0.0,
-                   help="Initial bias for vsa_gate; sigmoid(bias) = starting VSA contribution")
+                   help="Initial bias for gate_proj; sigmoid(bias) = starting VSA contribution")
     p.add_argument("--grad_clip",    type=float, default=0.5)
     p.add_argument("--beta1",        type=float, default=0.9)
     p.add_argument("--beta2",        type=float, default=0.90,
@@ -1050,6 +1091,13 @@ def parse_args():
     p.add_argument("--synthetic",    action="store_true",
                    help="Use synthetic data (no network required)")
 
+    # DeepSpeed
+    p.add_argument("--deepspeed", type=str, default=None, metavar="DS_CONFIG",
+                   help="Path to DeepSpeed config JSON (e.g. ds_config.json). "
+                        "Enables DeepSpeed ZeRO optimization. Omit to use native PyTorch.")
+    p.add_argument("--local_rank", type=int, default=-1,
+                   help="Local rank for DeepSpeed distributed launcher (auto-set by deepspeed)")
+
     # Regularization
     p.add_argument("--entropy_reg", type=float, default=0.0,
                    help="Entropy regularization coefficient: subtracts α·H(p) from loss "
@@ -1057,6 +1105,12 @@ def parse_args():
     p.add_argument("--embed_reg", type=float, default=0.0,
                    help="Embedding weight RMS regularization coefficient "
                         "to prevent embedding norm collapse/explosion")
+    p.add_argument("--z_loss", type=float, default=1e-4,
+                   help="Z-loss coefficient: penalizes log(Z)² to prevent logit "
+                        "explosion / softmax saturation (Palm / Gemma style). 0 = off.")
+    p.add_argument("--gate_entropy_loss", type=float, default=0.001,
+                   help="Gate entropy loss coefficient: encourages VSA gates to "
+                        "stay in an informative range, not saturate at 0 or 1. 0 = off.")
 
     # EMA model weights
     p.add_argument("--ema_decay", type=float, default=0.0,
@@ -1069,6 +1123,15 @@ def parse_args():
     p.add_argument("--spectral_norm_vsa", action="store_true", default=False,
                    help="Apply spectral normalization to VSA Linear layers "
                         "to prevent vanishing/exploding gradient paths")
+    p.add_argument("--vsa_gate_warmup", type=int, default=0,
+                   help="Freeze gate_proj for this many steps so attention builds a stable "
+                        "residual basis before VSA starts contributing. 0 = no freeze. "
+                        "Typical: 2000 steps.")
+    p.add_argument("--vsa_decay_reg", type=float, default=0.0,
+                   help="Penalize VSA per-dimension decay values approaching 1.0 "
+                        "(state collapse to initialization). Adds "
+                        "coeff * mean(clamp(decay - 0.85, min=0)) to loss. "
+                        "Typical: 0.01. 0 = disabled.")
 
     # Optional central config defaults
     try:
@@ -1264,18 +1327,70 @@ def main():
     optimizer = torch.optim.AdamW(
         param_groups,
         betas=(args.beta1, args.beta2),
-        fused=True,   # fused AdamW kernel — faster on CUDA
+        fused=not getattr(args, "deepspeed", None),  # fused conflicts with DeepSpeed wrapper
     )
 
     # bf16 doesn't overflow so GradScaler is unnecessary overhead.
     # fp16 path kept for completeness; on this GPU bf16 is always used.
-    use_scaler = (dtype == torch.float16)
+    use_scaler = (dtype == torch.float16) and not getattr(args, "deepspeed", None)
     scaler = torch.amp.GradScaler("cuda") if use_scaler else None
+
+    # ── DeepSpeed ────────────────────────────────────────────────────
+    # Optional ZeRO Stage 2 + CPU optimizer offload.  On a single GPU
+    # the main benefit is offloading Adam states to CPU RAM, freeing
+    # ~0.9 GB VRAM for a 113M-param model.
+    use_deepspeed = getattr(args, "deepspeed", None) is not None
+    ds_engine = None
+
+    if use_deepspeed:
+        import deepspeed
+
+        # Single-GPU: pre-init torch.distributed if not already done
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "29500")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            torch.distributed.init_process_group(backend="nccl")
+
+        ds_config_path = args.deepspeed
+        with open(ds_config_path) as f:
+            ds_config = json.load(f)
+
+        # We handle gradient accumulation ourselves in the training loop.
+        # Set DS-internal accumulation to 1 so engine.step() always updates.
+        ds_config["gradient_accumulation_steps"] = 1
+        ds_config["train_micro_batch_size_per_gpu"] = 1
+        ds_config["train_batch_size"] = 1
+        # We handle gradient clipping ourselves (custom VSA gradient scaling
+        # must happen between clip and step, which DeepSpeed can't do).
+        ds_config["gradient_clipping"] = 0.0
+        ds_config["zero_force_ds_cpu_optimizer"] = False
+        ds_config["torch_autocast"] = {"enabled": True}
+
+        # Mixed precision — match the AMP dtype selection
+        if dtype == torch.bfloat16:
+            ds_config["bf16"] = {"enabled": True}
+            ds_config["fp16"] = {"enabled": False}
+        else:
+            ds_config["bf16"] = {"enabled": False}
+            ds_config["fp16"] = {"enabled": True, "loss_scale": 0, "initial_scale_power": 16}
+
+        ds_engine, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            config=ds_config,
+        )
+        model = ds_engine
+        print(f"DeepSpeed: ZeRO stage {ds_config.get('zero_optimization', {}).get('stage', 0)}, "
+              f"CPU offload={'on' if ds_config.get('zero_optimization', {}).get('offload_optimizer', {}).get('device') == 'cpu' else 'off'}")
 
     # ── Raw model reference (pre-compile) ────────────────────────────
     # Must be kept before torch.compile so we can access nn.Module
     # interfaces for EMA updates and spectral norm application.
-    raw_model = model
+    # When using DeepSpeed, unwrap from the engine.
+    raw_model = ds_engine.module if use_deepspeed else model
 
     # Spectral normalization on VSA Linear layers — prevents vanishing /
     # exploding gradient paths through the novel VSA mechanism.
@@ -1288,6 +1403,21 @@ def main():
                 _sn_count += 1
         if _sn_count:
             print(f"Spectral norm: applied to {_sn_count} VSA Linear layers")
+
+    # VSA gate warmup freeze — hold gate_proj at its init value for the
+    # first N steps so attention builds a stable residual basis before
+    # VSA starts contributing.  Gates are unfrozen in the training loop.
+    vsa_gate_warmup = getattr(args, "vsa_gate_warmup", 0)
+    _vsa_gates_frozen = False
+    if vsa_gate_warmup > 0:
+        _gate_count = 0
+        for _gn, _gp in raw_model.named_parameters():
+            if "gate_proj" in _gn:
+                _gp.requires_grad_(False)
+                _gate_count += 1
+        if _gate_count:
+            _vsa_gates_frozen = True
+            print(f"VSA gate warmup: {_gate_count} gate tensor(s) frozen for {vsa_gate_warmup} steps")
 
     # EMA model — exponential moving average of weights for smoother
     # evaluation and generation quality (used in most modern LMs).
@@ -1348,11 +1478,26 @@ def main():
                 print(f"  tokenizer vocab expanded: {ckpt_vocab} → {run_vocab} (OK)")
         print(f"Resumed from step {start_step}, best val loss {best_val:.4f}, stage {resumed_stage_idx}")
 
+    # If resuming past the gate warmup point, unfreeze gates NOW before
+    # torch.compile so the compiled graph treats them as trainable parameters
+    # from the start (not as constants that would invalidate the graph later).
+    if _vsa_gates_frozen and start_step >= vsa_gate_warmup:
+        for _gn, _gp in raw_model.named_parameters():
+            if "gate_proj" in _gn:
+                _gp.requires_grad_(True)
+        _vsa_gates_frozen = False
+        print(f"VSA gates pre-unfrozen (resume step {start_step} >= warmup {vsa_gate_warmup})")
+
     # ── Compile ──────────────────────────────────────────────────────
     compile_requested = args.compile and not args.no_compile
     py314_or_newer = sys.version_info >= (3, 14)
 
-    if compile_requested and py314_or_newer:
+    if use_deepspeed:
+        # DeepSpeed wraps the model in its own engine; torch.compile on top
+        # of that causes tracing conflicts. Skip compile when DS is active.
+        if compile_requested:
+            print("Skipping torch.compile: incompatible with DeepSpeed engine")
+    elif compile_requested and py314_or_newer:
         print("Skipping torch.compile: not supported on Python 3.14+")
     elif compile_requested:
         try:
@@ -1360,6 +1505,14 @@ def main():
             # "reduce-overhead" (CUDA graphs) requires static tensor addresses but this
             # model has dynamic caches, conditional reasoning loops, and mask buffers
             # that alias into graph memory — causing corrupted view metadata crashes.
+            # Disable on-disk inductor cache: cached graphs bake in the
+            # current process's tensor memory addresses as shape constants.
+            # Loading a cache entry from a different process produces
+            # RuntimeError: shape '[<ptr>, <ptr>, 256]' is invalid for
+            # input of size N.  The in-process compiled graph is reused
+            # across training steps normally; only cross-run persistence
+            # is disabled.
+            torch._inductor.config.force_disable_caches = True
             print("Compiling model with torch.compile (default)...")
             model = torch.compile(model, mode="default")
         except RuntimeError as exc:
@@ -1484,7 +1637,8 @@ def main():
 
     # ── Training loop ────────────────────────────────────────────────
     model.train()
-    optimizer.zero_grad(set_to_none=True)
+    if not use_deepspeed:
+        optimizer.zero_grad(set_to_none=True)
 
     accum_loss = 0.0
     t0 = time.perf_counter()
@@ -1494,6 +1648,7 @@ def main():
     # Loss-spike detection: skip optimizer step when step loss > 1.5 × running EMA
     _loss_ema: float | None = None
     _loss_ema_alpha: float = 0.98          # ≈50-step half-life at log_interval=10
+    _consecutive_spikes: int = 0           # reset EMA after this many straight skips
     # LR cooldown: halve LR for 200 steps whenever val loss spikes above best × 1.15
     _lr_cooldown_steps: int = 0
     _lr_cooldown_scale: float = 1.0
@@ -1564,6 +1719,22 @@ def main():
             _lr_cooldown_steps -= 1
         set_lr(optimizer, lr, args.vsa_lr_scale)
 
+        # VSA gate unfreeze — once we've built a stable attention basis,
+        # allow gate_proj to start training.
+        if _vsa_gates_frozen and step >= vsa_gate_warmup:
+            for _gn, _gp in raw_model.named_parameters():
+                if "gate_proj" in _gn:
+                    _gp.requires_grad_(True)
+            _vsa_gates_frozen = False
+            # Changing requires_grad invalidates the compiled graph's assumptions
+            # about which tensors are leaves/constants. Reset dynamo so the next
+            # forward pass triggers a clean recompile.
+            torch._dynamo.reset()
+            tqdm.write(
+                f"  🔓 VSA gates unfrozen at step {step} "
+                f"(vsa_gate_warmup={vsa_gate_warmup} reached)"
+            )
+
         # Gradient accumulation
         _micro_loss_sum = 0.0
         for micro in range(current_stage.grad_accum):
@@ -1582,8 +1753,10 @@ def main():
             batch = batch.to(device)
 
             # Prepend mode control token for mode-conditioned reasoning.
-            # Skip whenever CoT is present in this stage (CoT rows already include control spans).
-            if use_mode_training and current_stage.cot_mix == 0.0:
+            # Skip when the stage sets skip_mode_tokens=True (CoT, instruction,
+            # and preference data already have their own format and don't
+            # expect a leading mode token).
+            if use_mode_training and not current_stage.skip_mode_tokens:
                 batch = sample_mode_tokens(
                     batch, config.mode_token_ids,
                     mode_mix=mode_mix, rng=mode_rng,
@@ -1614,7 +1787,45 @@ def main():
                     _emb_rms = (raw_model.embedding.weight.float() ** 2).mean().sqrt()
                     loss = loss + args.embed_reg * _emb_rms / current_stage.grad_accum
 
-            if use_scaler:
+                # ── VSA decay regularization ───────────────────────────
+                # Penalize per-dimension decay values approaching 1.0, which
+                # causes the global VSA state to stop updating (collapse to
+                # its initialization).  Only values above 0.85 are penalized.
+                if args.vsa_decay_reg > 0.0:
+                    _dp = torch.zeros(1, device=device, dtype=loss.dtype)
+                    for _rl in raw_model.layers.layers:
+                        _d = torch.sigmoid(_rl.soft_vsa.decay_logit)
+                        _dp = _dp + (_d - 0.85).clamp(min=0).mean()
+                    loss = loss + args.vsa_decay_reg * _dp / current_stage.grad_accum
+
+                # ── Z-loss (logit explosion prevention) ────────────────
+                # Penalizes log(Z)² where Z = Σ exp(logit).  Prevents
+                # softmax saturation and logit drift.
+                # Reference: PaLM (Chowdhery et al. 2022), Gemma 2.
+                if args.z_loss > 0.0:
+                    _logits_z = out.get("logits")
+                    if _logits_z is not None:
+                        _log_z = torch.logsumexp(_logits_z.float(), dim=-1)
+                        _z_penalty = (_log_z ** 2).mean()
+                        loss = loss + args.z_loss * _z_penalty / current_stage.grad_accum
+
+                # ── Gate entropy loss (VSA gate utilization) ───────────
+                # Encourages per-layer VSA gates to stay in an informative
+                # range [~0.1, ~0.9] rather than saturating at 0 or 1.
+                # Maximizes binary entropy H(g) = -g*log(g) - (1-g)*log(1-g).
+                if args.gate_entropy_loss > 0.0:
+                    _ge = torch.zeros(1, device=device, dtype=loss.dtype)
+                    _eps_ge = 1e-8
+                    for _gl in raw_model.layers.layers:
+                        _g = torch.sigmoid(_gl.gate_proj.bias.float())
+                        _h = -_g * (_g + _eps_ge).log() - (1 - _g) * (1 - _g + _eps_ge).log()
+                        _ge = _ge + _h.mean()
+                    # Negative because we MAXIMIZE entropy (minimize -entropy)
+                    loss = loss - args.gate_entropy_loss * _ge / current_stage.grad_accum
+
+            if use_deepspeed:
+                ds_engine.backward(loss)
+            elif use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
@@ -1631,24 +1842,47 @@ def main():
             _micro_loss_sum += _lv
             tokens_seen += input_ids.numel()
 
-        # Loss spike detection — skip bad batches before they corrupt the model
-        if _loss_ema is not None and _micro_loss_sum > 1.5 * _loss_ema:
-            tqdm.write(
-                f"  ⚡ Loss spike at step {step+1}: {_micro_loss_sum:.4f} > "
-                f"1.5 × ema {_loss_ema:.4f} — skipping optimizer step"
-            )
-            optimizer.zero_grad(set_to_none=True)
-            accum_loss -= _micro_loss_sum
-            continue
+        # Always update EMA unconditionally so the threshold adapts to the
+        # current loss level and cannot freeze from a stale low-loss phase.
         _loss_ema = _micro_loss_sum if _loss_ema is None else (
             _loss_ema_alpha * _loss_ema + (1 - _loss_ema_alpha) * _micro_loss_sum
         )
+
+        # Loss spike detection — skip bad batches before they corrupt the model
+        if _micro_loss_sum > 1.5 * _loss_ema:
+            _consecutive_spikes += 1
+            # Safety valve: if EMA is hopelessly stale, hard-reset it so training
+            # can resume instead of being deadlocked forever.
+            if _consecutive_spikes >= 100:
+                tqdm.write(
+                    f"  ⚠️  {_consecutive_spikes} consecutive spikes — "
+                    f"resetting loss EMA from {_loss_ema:.4f} to {_micro_loss_sum:.4f}"
+                )
+                _loss_ema = _micro_loss_sum
+                _consecutive_spikes = 0
+                # fall through and allow this step
+            else:
+                tqdm.write(
+                    f"  ⚡ Loss spike at step {step+1}: {_micro_loss_sum:.4f} > "
+                    f"1.5 × ema {_loss_ema:.4f} — skipping optimizer step"
+                )
+                if use_deepspeed:
+                    ds_engine.optimizer.zero_grad()
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                accum_loss -= _micro_loss_sum
+                continue
+        else:
+            _consecutive_spikes = 0
 
         # Gradient clipping
         if args.grad_clip > 0:
             if use_scaler:
                 scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # For DeepSpeed, gradients are already unscaled (bf16 mode);
+            # clip on raw_model.parameters() to reach the actual params.
+            _clip_params = raw_model.parameters() if use_deepspeed else model.parameters()
+            grad_norm = nn.utils.clip_grad_norm_(_clip_params, args.grad_clip)
         else:
             grad_norm = 0.0
         grad_norm_value = float(grad_norm)
@@ -1663,7 +1897,7 @@ def main():
         # Iterating all params + .norm(2) forces GPU sync — only do every 100 steps.
         branch_norms_str = ""
         if args.log_branch_grad_norms and (step + 1) % max(args.log_interval * 10, 100) == 0:
-            bnorms = compute_branch_grad_norms(model)
+            bnorms = compute_branch_grad_norms(raw_model if use_deepspeed else model)
             def _fmt_grad(v: float) -> str:
                 if v == 0.0:
                     return "0"
@@ -1676,12 +1910,15 @@ def main():
                 f"∇ffn {_fmt_grad(bnorms['ffn'])}"
             )
 
-        if use_scaler:
+        if use_deepspeed:
+            ds_engine.step()
+        elif use_scaler:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        if not use_deepspeed:
+            optimizer.zero_grad(set_to_none=True)
 
         # EMA weight update — blend live weights into the EMA shadow copy.
         # Uses raw_model to bypass the torch.compile wrapper.
@@ -1720,7 +1957,10 @@ def main():
             val_loss = evaluate(model, val_iter, args.eval_steps, device, ctx)
             gate_str = ""
             if args.log_gate_values:
-                gate_str = "\n" + log_gate_values(model)
+                gate_str = "\n" + log_gate_values(raw_model)
+
+            # VSA decay health check — logged every eval to catch state collapse early
+            vsa_health_str = "\n" + log_vsa_state_health(raw_model)
 
             # EMA model validation — separate fresh iterator to avoid bias
             ema_val_str = ""
@@ -1735,6 +1975,7 @@ def main():
                 f"[stage {current_stage.index}, seq={current_stage.seq_len}]"
                 f"{ema_val_str}"
                 f"{gate_str}"
+                f"{vsa_health_str}"
             )
             if best_val < float("inf") and val_loss > best_val * 1.15:
                 _lr_cooldown_steps = 200

@@ -23,6 +23,8 @@ Training stability:
     be warmed up at a lower LR before joint training.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,6 +52,10 @@ class HybridNSVSAConfig:
     num_layers: int = 6         # Number of hybrid layers
     num_heads: int = 8          # Attention heads per layer
     max_seq_len: int = 2048     # Maximum sequence length
+
+    # Stability
+    logit_softcap: float = 30.0 # Soft-cap logits at ±this value (Gemma 2 style, 0=off)
+    embed_scale: bool = True    # Scale embeddings by √d_model
 
     # Local attention
     window_size: int = 128      # W – local attention window
@@ -186,15 +192,40 @@ class HybridNSVSA(nn.Module):
     # ------------------------------------------------------------------
 
     def _init_weights(self):
-        """Scaled normal initialisation (GPT-2 style)."""
+        """Scaled normal initialisation with depth-adjusted output projections.
+
+        Output projections (out_proj, down_proj, vsa_out_proj) are scaled by
+        1/√(2·N) where N is the number of layers.  This prevents residual
+        stream magnitude growth and gradient explosion in deep networks.
+        (GPT-2 / muP convention, also used by LLaMA and Gemma.)
+
+        VSA gate and decay projections are zero-initialized so the model
+        starts from the static baseline and learns modulations gradually.
+        """
         std = 0.02
-        for module in self.modules():
+        n_layers = self.config.num_layers
+        residual_std = std / math.sqrt(2 * n_layers)
+
+        for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if any(name.endswith(s) for s in ('out_proj', 'down_proj', 'vsa_out_proj')):
+                    nn.init.normal_(module.weight, mean=0.0, std=residual_std)
+                else:
+                    nn.init.normal_(module.weight, mean=0.0, std=std)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
+
+        # Special: zero-init VSA gate and decay projections for smooth start
+        for name, param in self.named_parameters():
+            if 'gate_proj.weight' in name:
+                nn.init.zeros_(param)
+            elif 'gate_proj.bias' in name:
+                param.data.fill_(self.config.gate_init_bias)
+            elif 'decay_proj.weight' in name:
+                nn.init.zeros_(param)
+
         # Don't re-init the learned position embeddings (already warm-started)
         if self.config.learned_vsa_positions:
             pass  # local_pos_embed and macro_pos_embed keep their RoPE init
@@ -300,7 +331,10 @@ class HybridNSVSA(nn.Module):
         cfg = self.config
 
         # ── Embed ────────────────────────────────────────────────────
-        x = self.embed_drop(self.embed_norm(self.embedding(input_ids)))  # [B, L, d]
+        x = self.embedding(input_ids)
+        if cfg.embed_scale:
+            x = x * math.sqrt(cfg.d_model)
+        x = self.embed_drop(self.embed_norm(x))  # [B, L, d]
 
         # ── Detect thinking mode from control tokens ────────────────
         if mode_ids is None:
@@ -334,6 +368,11 @@ class HybridNSVSA(nn.Module):
 
         # ── LM head ─────────────────────────────────────────────────
         logits = self.lm_head(hidden)  # [B, L, vocab_size]
+
+        # Logit soft-capping (Gemma 2 / Gemma 3 style): prevents outlier
+        # logits that cause repetition, degeneration, and softmax saturation.
+        if cfg.logit_softcap > 0:
+            logits = cfg.logit_softcap * torch.tanh(logits / cfg.logit_softcap)
 
         output: Dict[str, Any] = {"logits": logits}
         if mode_ids is not None:
@@ -376,7 +415,9 @@ class HybridNSVSA(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = 50,
         top_p: Optional[float] = None,
+        min_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Cached autoregressive generation.
@@ -387,6 +428,7 @@ class HybridNSVSA(nn.Module):
                             Cost per token: O(W) attention + O(1) VSA.
         """
         self.eval()
+        B = input_ids.shape[0]
         generated = input_ids.clone()
 
         # ── Prefill ──────────────────────────────────────────────────
@@ -395,12 +437,31 @@ class HybridNSVSA(nn.Module):
         logits = out["logits"][:, -1, :]  # [B, V]
 
         for _ in range(max_new_tokens):
-            # Repetition penalty
+            # Repetition penalty — sign-aware, per-batch-element.
+            # Positive logits are divided, negative logits are multiplied,
+            # so the penalty always pushes toward less likely.
             if repetition_penalty != 1.0:
-                for token_id in generated[0].unique():
-                    logits[:, token_id] /= repetition_penalty
+                logits = logits.clone()
+                for b in range(B):
+                    seen = generated[b].unique()
+                    for token_id in seen:
+                        if logits[b, token_id] > 0:
+                            logits[b, token_id] /= repetition_penalty
+                        else:
+                            logits[b, token_id] *= repetition_penalty
 
             logits = logits / max(temperature, 1e-8)
+
+            # Min-p: adaptive threshold — keeps tokens with probability
+            # >= min_p * max_probability.  Better than fixed top-k because
+            # it adapts to distribution entropy (sharp → fewer tokens,
+            # flat → more tokens).
+            if min_p is not None and min_p > 0:
+                probs_for_filter = F.softmax(logits, dim=-1)
+                max_prob = probs_for_filter.max(dim=-1, keepdim=True).values
+                logits = logits.masked_fill(
+                    probs_for_filter < min_p * max_prob, float("-inf")
+                )
 
             # Top-k
             if top_k is not None:
@@ -420,6 +481,10 @@ class HybridNSVSA(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, 1)  # [B, 1]
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Early stop on EOS
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
 
             # ── Cached decode step ───────────────────────────────────
             out = self.forward(next_token, cache=cache, use_cache=True)

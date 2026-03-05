@@ -13,3 +13,7 @@ uvicorn[standard]>=0.24.0
 # Optional dependencies
 matplotlib>=3.5.0  # For visualization
 tqdm>=4.62.0  # For progress bars
+
+# Performance (optional)
+deepspeed>=0.14.0  # ZeRO optimizer offload, single-GPU memory savings
+triton>=3.0.0  # Fused kernels: RMSNorm, sliding-window attention
